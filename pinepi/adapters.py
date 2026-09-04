@@ -113,7 +113,8 @@ class AdapterService:
             wireless = (self.sys_net / name / "wireless").exists() or name.startswith(("wl", "wlan"))
             info = self.privileged.wireless_info(name) if wireless else {}
             capabilities = self._capabilities(name) if wireless else {
-                "known": True, "managed": False, "monitor": False, "ap": False, "ap_channels": [],
+                "known": True, "managed": False, "monitor": False, "ap": False,
+                "ap_channels": [], "ap_channel_state": "none",
             }
             ipv4 = [a.address for a in addresses.get(name, []) if getattr(a.family, "name", "") == "AF_INET"]
             is_up = bool(stat and stat.isup)
@@ -145,6 +146,44 @@ class AdapterService:
                 usable = bool(is_up)
                 reason = None if is_up else "No active network link."
             nm_state = self.privileged.networkmanager_state(name)
+            ap_capable = bool(capabilities.get("ap"))
+            ap_channels = capabilities.get("ap_channels") or []
+            reported_channel_state = capabilities.get("ap_channel_state")
+            if ap_channels:
+                ap_channel_state = "known"
+            elif reported_channel_state in {"unknown", "none"}:
+                ap_channel_state = reported_channel_state
+            else:
+                # Empty legacy results from AP-capable radios are indeterminate, not
+                # proof that the PHY has no regulatory-valid channels.
+                ap_channel_state = "unknown" if ap_capable else "none"
+
+            ap_selectable = bool(
+                wireless
+                and ap_capable
+                and not reserved
+                and role is None
+                and usable
+                and ap_channel_state == "known"
+                and ap_channels
+            )
+            if reserved:
+                ap_selection_reason = "Reserved for the PinePi management access point."
+            elif ap_capable and role:
+                ap_selection_reason = f"Busy with {role.replace('_', ' ')}."
+            elif not ap_capable:
+                ap_selection_reason = "Adapter does not support AP mode."
+            elif not usable:
+                ap_selection_reason = reason or "Adapter is not ready."
+            elif ap_channel_state == "unknown":
+                ap_selection_reason = "Unable to determine supported AP channels."
+            elif ap_channel_state == "none":
+                ap_selection_reason = (
+                    "Adapter supports AP mode but no usable AP channels are available "
+                    "in the current regulatory domain."
+                )
+            else:
+                ap_selection_reason = None
             interfaces.append(
                 {
                     "name": name,
@@ -163,7 +202,10 @@ class AdapterService:
                     "usable": usable,
                     "reason": reason,
                     "capabilities": capabilities,
-                    "ap_capable": bool(capabilities.get("ap")),
+                    "ap_capable": ap_capable,
+                    "ap_channel_state": ap_channel_state,
+                    "ap_selectable": ap_selectable,
+                    "ap_selection_reason": ap_selection_reason,
                     "monitor_capable": bool(capabilities.get("monitor")),
                     "connected": is_up and bool(ipv4),
                     "connectivity": name in default_routes,
@@ -205,9 +247,27 @@ class AdapterService:
 
     def require_ap_channel(self, interface: str, channel: int) -> dict:
         item = self.get(interface)
-        channels = item.get("capabilities", {}).get("ap_channels") or []
+        capabilities = item.get("capabilities", {})
+        channels = capabilities.get("ap_channels") or []
+        channel_state = item.get("ap_channel_state")
+        if channel_state == "unknown":
+            raise PinePiError(
+                "AP_CHANNELS_UNKNOWN",
+                "Unable to determine supported AP channels.",
+                409,
+                {"interface": interface, "channel_state": channel_state},
+            )
+        if channel_state == "none":
+            domain = capabilities.get("regulatory_domain") or "current"
+            raise PinePiError(
+                "NO_AP_CHANNELS",
+                "Adapter supports AP mode but no usable AP channels are available "
+                f"in the {domain} regulatory domain.",
+                409,
+                {"interface": interface, "channel_state": channel_state, "regulatory_domain": domain},
+            )
         if channel not in channels:
-            domain = item.get("capabilities", {}).get("regulatory_domain") or "current"
+            domain = capabilities.get("regulatory_domain") or "current"
             raise PinePiError(
                 "UNSUPPORTED_CHANNEL",
                 f"Channel {channel} is not supported by {interface} in the {domain} regulatory domain.",

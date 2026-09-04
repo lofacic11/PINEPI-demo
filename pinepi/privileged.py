@@ -18,6 +18,81 @@ from .adapters import INTERFACE_PATTERN, MANAGEMENT_INTERFACE
 from .errors import PinePiError
 
 
+IW_FREQUENCY_PATTERN = re.compile(
+    r"^\s*\*\s*(?P<frequency>\d+(?:\.\d+)?)\s*MHz\s*"
+    r"\[\s*(?P<channel>\d+)\s*\](?P<details>.*)$",
+    re.IGNORECASE,
+)
+
+
+def parse_iw_ap_channels(output: str) -> dict:
+    """Parse AP-usable channels from integer or decimal ``iw phy`` frequencies."""
+
+    raw_frequency_count = 0
+    parsed_channel_count = 0
+    usable_channels: list[int] = []
+    restricted_channels: list[int] = []
+    restriction_counts = {"disabled": 0, "no_ir": 0, "passive_scan": 0, "radar": 0}
+    errors: list[str] = []
+
+    for line_number, raw_line in enumerate(output.splitlines(), start=1):
+        if not re.search(r"\bMHz\b", raw_line, re.IGNORECASE):
+            continue
+        raw_frequency_count += 1
+        match = IW_FREQUENCY_PATTERN.match(raw_line)
+        if match is None:
+            if len(errors) < 5:
+                errors.append(f"line {line_number}: unrecognized frequency/channel syntax")
+            continue
+
+        parsed_channel_count += 1
+        channel = int(match.group("channel"))
+        details = re.sub(r"[-_]", " ", match.group("details").lower())
+        # The kernel has already applied the active regulatory domain to these
+        # per-frequency flags. Avoid a second, brittle country/channel table here.
+        restrictions = {
+            "disabled": re.search(r"\bdisabled\b", details) is not None,
+            "no_ir": re.search(r"\bno\s+ir\b", details) is not None,
+            "passive_scan": re.search(r"\bpassive\s+scan(?:ning)?\b", details) is not None,
+            "radar": re.search(r"\bradar(?:\s+detection)?\b", details) is not None,
+        }
+        for restriction, present in restrictions.items():
+            if present:
+                restriction_counts[restriction] += 1
+        if any(restrictions.values()):
+            restricted_channels.append(channel)
+        else:
+            usable_channels.append(channel)
+
+    channels = sorted(set(usable_channels))
+    if channels:
+        state = "known"
+        reason = None
+    elif errors:
+        state = "unknown"
+        reason = "Unable to parse usable frequency/channel entries from iw PHY output."
+    elif parsed_channel_count:
+        state = "none"
+        reason = (
+            "The PHY exposes frequencies, but none can currently initiate an AP "
+            "under its regulatory restrictions."
+        )
+    else:
+        state = "unknown"
+        reason = "No frequency/channel entries were found in iw PHY output."
+
+    return {
+        "ap_channels": channels,
+        "ap_channel_state": state,
+        "channel_reason": reason,
+        "raw_frequency_count": raw_frequency_count,
+        "parsed_channel_count": parsed_channel_count,
+        "restricted_channel_count": len(restricted_channels),
+        "channel_restrictions": restriction_counts,
+        "channel_parse_errors": errors,
+    }
+
+
 @dataclass
 class CommandResult:
     returncode: int
@@ -254,36 +329,77 @@ class PrivilegedService:
         return info
 
     def wireless_capabilities(self, interface: str) -> dict:
+        def finish(capabilities: dict) -> dict:
+            self._log_capability_detection(interface, capabilities)
+            return capabilities
+
         if not INTERFACE_PATTERN.fullmatch(interface):
-            return {"known": False, "managed": False, "monitor": False, "ap": False, "ap_channels": [], "reason": "Invalid interface name."}
+            return finish({
+                "known": False, "managed": False, "monitor": False, "ap": False,
+                "ap_channels": [], "ap_channel_state": "unknown",
+                "channel_reason": "Invalid interface name.", "raw_frequency_count": 0,
+                "parsed_channel_count": 0, "restricted_channel_count": 0,
+                "channel_restrictions": {},
+                "channel_parse_errors": ["Invalid interface name."],
+                "reason": "Invalid interface name.",
+            })
         info = self.wireless_info(interface)
         wiphy = info.get("wiphy")
         if wiphy is None:
-            return {
+            reason = "Waiting for nl80211 to expose wireless capabilities."
+            return finish({
                 "known": False, "managed": False, "monitor": False, "ap": False, "ap_channels": [],
-                "reason": "Waiting for nl80211 to expose wireless capabilities.",
-            }
+                "ap_channel_state": "unknown", "channel_reason": reason,
+                "raw_frequency_count": 0, "parsed_channel_count": 0,
+                "restricted_channel_count": 0,
+                "channel_restrictions": {}, "channel_parse_errors": [reason], "reason": reason,
+            })
         result = self.run(["iw", "phy", f"phy{wiphy}", "info"], check=False)
         if result.returncode != 0:
-            return {
+            reason = self._bounded_text(result.stderr) or "Unable to read nl80211 capabilities."
+            return finish({
                 "known": False, "managed": False, "monitor": False, "ap": False, "ap_channels": [],
-                "reason": self._bounded_text(result.stderr) or "Unable to read nl80211 capabilities.",
-            }
+                "ap_channel_state": "unknown", "channel_reason": reason,
+                "raw_frequency_count": 0, "parsed_channel_count": 0,
+                "restricted_channel_count": 0,
+                "channel_restrictions": {}, "channel_parse_errors": [reason[:240]],
+                "reason": reason, "wiphy": f"phy{wiphy}",
+            })
         text = result.stdout.lower()
-        channels: list[int] = []
-        for line in result.stdout.splitlines():
-            match = re.search(r"\*\s+\d+\s+MHz\s+\[([0-9]+)\](.*)$", line, re.IGNORECASE)
-            if match and "disabled" not in match.group(2).lower() and "no ir" not in match.group(2).lower():
-                channels.append(int(match.group(1)))
-        return {
+        channel_data = parse_iw_ap_channels(result.stdout)
+        capabilities = {
             "known": True,
             "managed": bool(re.search(r"^\s*\*\s+managed\s*$", text, re.MULTILINE)),
             "monitor": bool(re.search(r"^\s*\*\s+monitor\s*$", text, re.MULTILINE)),
             "ap": bool(re.search(r"^\s*\*\s+ap\s*$", text, re.MULTILINE)),
-            "ap_channels": sorted(set(channels)),
             "regulatory_domain": self.regulatory_domain(),
             "wiphy": f"phy{wiphy}",
+            **channel_data,
         }
+        return finish(capabilities)
+
+    @staticmethod
+    def _log_capability_detection(interface: str, capabilities: dict) -> None:
+        safe_interface = interface if INTERFACE_PATTERN.fullmatch(interface) else "invalid"
+        errors = [str(error)[:240] for error in (capabilities.get("channel_parse_errors") or [])[:5]]
+        channels = capabilities.get("ap_channels") or []
+        fields = (
+            f"interface={safe_interface}",
+            f"phy={capabilities.get('wiphy', 'unknown')}",
+            f"ap_capable={str(bool(capabilities.get('ap'))).lower()}",
+            f"raw_frequency_count={capabilities.get('raw_frequency_count', 0)}",
+            f"parsed_channel_count={capabilities.get('parsed_channel_count', 0)}",
+            f"filtered_ap_channels={json.dumps(channels, separators=(',', ':'))}",
+            f"regulatory_domain={capabilities.get('regulatory_domain', 'unknown')}",
+            f"ap_channel_state={capabilities.get('ap_channel_state', 'unknown')}",
+            "channel_restrictions="
+            f"{json.dumps(capabilities.get('channel_restrictions') or {}, separators=(',', ':'))}",
+            f"channel_parse_errors={json.dumps(errors, separators=(',', ':'))}",
+        )
+        try:
+            print(f"pinepi-helper stage=capability_detection {' '.join(fields)}", flush=True)
+        except OSError:
+            pass
 
     def regulatory_domain(self) -> str:
         result = self.run(["iw", "reg", "get"], check=False)
@@ -362,7 +478,27 @@ class PrivilegedService:
                 "ADAPTER_UNSUPPORTED", message, 409,
                 {"stage": "capability_check", "interface": interface, "capabilities": capabilities},
             )
-        if channel not in capabilities.get("ap_channels", []):
+        available_channels = capabilities.get("ap_channels") or []
+        channel_state = capabilities.get("ap_channel_state") or (
+            "known" if available_channels else "unknown"
+        )
+        if channel_state == "unknown":
+            raise PinePiError(
+                "AP_CHANNELS_UNKNOWN",
+                "Unable to determine supported AP channels.",
+                409,
+                {"stage": "channel_detection", "interface": interface, "capabilities": capabilities},
+            )
+        if channel_state == "none":
+            domain = capabilities.get("regulatory_domain") or "current"
+            raise PinePiError(
+                "NO_AP_CHANNELS",
+                "Adapter supports AP mode but no usable AP channels are available "
+                f"in the {domain} regulatory domain.",
+                409,
+                {"stage": "channel_validation", "interface": interface, "capabilities": capabilities},
+            )
+        if channel not in available_channels:
             domain = capabilities.get("regulatory_domain") or "current"
             raise PinePiError(
                 "UNSUPPORTED_CHANNEL",
@@ -370,7 +506,7 @@ class PrivilegedService:
                 409,
                 {
                     "stage": "channel_validation", "interface": interface, "channel": channel,
-                    "supported_channels": capabilities.get("ap_channels", []), "regulatory_domain": domain,
+                    "supported_channels": available_channels, "regulatory_domain": domain,
                 },
             )
         return capabilities

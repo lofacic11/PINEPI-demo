@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from pinepi.errors import PinePiError
-from pinepi.privileged import PrivilegedService
+from pinepi.privileged import PrivilegedService, parse_iw_ap_channels
 
 
 class ProcessStub:
@@ -272,7 +273,7 @@ def test_managed_monitor_managed_transition_uses_owned_interface_only(tmp_path):
     ]
 
 
-def test_wireless_capabilities_parse_modes_and_regulatory_channels(tmp_path):
+def test_wireless_capabilities_parse_modes_and_regulatory_channels(tmp_path, capsys):
     phy = """
 Supported interface modes:
          * managed
@@ -301,4 +302,160 @@ Band 1:
     assert capabilities["monitor"] is True
     assert capabilities["ap"] is True
     assert capabilities["ap_channels"] == [1, 6]
+    assert capabilities["ap_channel_state"] == "known"
+    assert capabilities["raw_frequency_count"] == 4
+    assert capabilities["parsed_channel_count"] == 4
     assert capabilities["regulatory_domain"] == "AT"
+    diagnostic = capsys.readouterr().out
+    assert "stage=capability_detection interface=wlan1 phy=phy1 ap_capable=true" in diagnostic
+    assert "raw_frequency_count=4 parsed_channel_count=4" in diagnostic
+    assert "filtered_ap_channels=[1,6] regulatory_domain=AT" in diagnostic
+
+
+def test_real_iw_69_decimal_fixture_retains_at_ap_channels(tmp_path):
+    fixture = Path(__file__).parent / "fixtures" / "iw_phy2_decimal.txt"
+    phy = fixture.read_text(encoding="utf-8")
+
+    def runner(argv, **_kwargs):
+        if argv[:3] == ["iw", "dev", "wlan1"]:
+            return SimpleNamespace(
+                returncode=0,
+                stdout="Interface wlan1\n\twiphy 2\n\ttype managed\n",
+                stderr="",
+            )
+        if argv[:3] == ["iw", "phy", "phy2"]:
+            return SimpleNamespace(returncode=0, stdout=phy, stderr="")
+        if argv[:3] == ["iw", "reg", "get"]:
+            return SimpleNamespace(returncode=0, stdout="country AT: DFS-ETSI\n", stderr="")
+        return SimpleNamespace(returncode=1, stdout="", stderr="unexpected")
+
+    capabilities = PrivilegedService(
+        tmp_path / "runtime", runner=runner
+    ).wireless_capabilities("wlan1")
+
+    assert capabilities["ap"] is True
+    assert capabilities["ap_channel_state"] == "known"
+    assert capabilities["raw_frequency_count"] == 62
+    assert capabilities["parsed_channel_count"] == 62
+    assert capabilities["restricted_channel_count"] == 34
+    assert capabilities["channel_restrictions"] == {
+        "disabled": 5,
+        "no_ir": 0,
+        "passive_scan": 0,
+        "radar": 29,
+    }
+    assert capabilities["channel_parse_errors"] == []
+    assert capabilities["regulatory_domain"] == "AT"
+    assert capabilities["ap_channels"] == [
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13,
+        36, 38, 40, 42, 44, 46, 48,
+        149, 151, 153, 155, 157, 159, 161, 165,
+    ]
+
+
+def test_second_real_iw_69_adapter_fixture_retains_channel_6():
+    fixture = Path(__file__).parent / "fixtures" / "iw_phy3_decimal.txt"
+
+    result = parse_iw_ap_channels(fixture.read_text(encoding="utf-8"))
+
+    assert result["raw_frequency_count"] == 39
+    assert result["parsed_channel_count"] == 39
+    assert result["restricted_channel_count"] == 17
+    assert result["channel_parse_errors"] == []
+    assert result["ap_channels"] == [
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13,
+        36, 40, 44, 48, 149, 153, 157, 161, 165,
+    ]
+
+
+def test_frequency_parser_handles_integer_decimal_6ghz_spacing_and_restrictions():
+    fixture = Path(__file__).parent / "fixtures" / "iw_phy_mixed_formats.txt"
+
+    result = parse_iw_ap_channels(fixture.read_text(encoding="utf-8"))
+
+    assert result["raw_frequency_count"] == 8
+    assert result["parsed_channel_count"] == 7
+    assert result["restricted_channel_count"] == 3
+    assert result["channel_restrictions"] == {
+        "disabled": 1,
+        "no_ir": 1,
+        "passive_scan": 0,
+        "radar": 1,
+    }
+    assert result["ap_channels"] == [1, 6, 13, 36]
+    assert result["ap_channel_state"] == "known"
+    assert result["channel_parse_errors"] == [
+        "line 19: unrecognized frequency/channel syntax"
+    ]
+
+
+def test_ap_mode_and_channel_detection_states_are_independent(tmp_path):
+    outputs = [
+        "Supported interface modes:\n * managed\n * AP\n * monitor\n * 2412.0 MHz channel 1 (20.0 dBm)\n",
+        "Supported interface modes:\n * managed\n * AP\n * monitor\n * 2412.0 MHz [1] (disabled)\n * 5180.0 MHz [36] (no IR)\n",
+        "Supported interface modes:\n * managed\n * monitor\n * 2412.0 MHz [1] (20.0 dBm)\n",
+    ]
+
+    def capabilities_for(index):
+        def runner(argv, **_kwargs):
+            if argv[:3] == ["iw", "dev", "wlan1"]:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout="Interface wlan1\n wiphy 2\n type managed\n",
+                    stderr="",
+                )
+            if argv[:3] == ["iw", "phy", "phy2"]:
+                return SimpleNamespace(returncode=0, stdout=outputs[index], stderr="")
+            if argv[:3] == ["iw", "reg", "get"]:
+                return SimpleNamespace(returncode=0, stdout="country AT: DFS-ETSI\n", stderr="")
+            return SimpleNamespace(returncode=1, stdout="", stderr="unexpected")
+
+        return PrivilegedService(
+            tmp_path / f"runtime-{index}", runner=runner
+        ).wireless_capabilities("wlan1")
+
+    parse_failure = capabilities_for(0)
+    assert parse_failure["ap"] is True
+    assert parse_failure["ap_channels"] == []
+    assert parse_failure["ap_channel_state"] == "unknown"
+
+    no_usable_channels = capabilities_for(1)
+    assert no_usable_channels["ap"] is True
+    assert no_usable_channels["ap_channel_state"] == "none"
+
+    no_ap_mode = capabilities_for(2)
+    assert no_ap_mode["ap"] is False
+    assert no_ap_mode["ap_channels"] == [1]
+    assert no_ap_mode["ap_channel_state"] == "known"
+
+
+@pytest.mark.parametrize(
+    ("channel_state", "error_code", "message"),
+    [
+        ("unknown", "AP_CHANNELS_UNKNOWN", "Unable to determine supported AP channels."),
+        (
+            "none",
+            "NO_AP_CHANNELS",
+            "Adapter supports AP mode but no usable AP channels are available in the AT regulatory domain.",
+        ),
+    ],
+)
+def test_ap_channel_validation_reports_detection_state(
+    tmp_path, channel_state, error_code, message
+):
+    service = PrivilegedService(tmp_path / f"runtime-{channel_state}")
+    service.wireless_capabilities = lambda _interface: {
+        "known": True,
+        "managed": True,
+        "monitor": True,
+        "ap": True,
+        "ap_channels": [],
+        "ap_channel_state": channel_state,
+        "regulatory_domain": "AT",
+    }
+
+    with pytest.raises(PinePiError) as caught:
+        service.validate_ap_channel("wlan1", 6)
+
+    assert caught.value.code == error_code
+    assert caught.value.message == message

@@ -24,4 +24,11 @@ def test_dashboard_uses_pinepi_state_and_ap_errors_are_persistent():
     assert 'label = "Ready"' in script
     assert 'item.connected ? "Online" : item.state' not in script
     assert "state.apError" in script
-    assert "monitor only (AP unsupported)" in script
+    assert "function apSelectable(item)" in script
+    assert "item.ap_selectable === true || inferred" in script
+    assert 'apChannelState(item) === "known"' in script
+    assert "Unable to determine supported AP channels." in script
+    assert "Adapter supports AP mode but no usable AP channels are available" in script
+    assert "Adapter does not support AP mode." in script
+    assert "No ready adapter currently supports AP mode." in script
+    assert "No free AP-capable adapter" not in script

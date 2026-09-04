@@ -1,0 +1,19 @@
+Wiphy phy7
+  Supported interface modes:
+    * managed
+    * AP
+    * monitor
+  Band 1:
+    Frequencies:
+      * 2412 MHz [1] (20.0 dBm)
+       * 2437.0 MHz [6] (20.0 dBm)
+  Band 2:
+    Frequencies:
+     *5180.000 MHz[36] (23.0 dBm)
+      * 5200.0 MHz [40] (disabled)
+      * 5220.0 MHz [44] (no-IR)
+      * 5260.0 MHz [52] (radar detection)
+  Band 4:
+    Frequencies:
+      * 6015.0 MHz [13] (23.0 dBm)
+      * 6035.0 MHz channel 17 (23.0 dBm)

@@ -75,28 +75,46 @@ function fillSelect(node, items, predicate, label, placeholder, forceValue = nul
   if ([...node.options].some((item) => item.value === selected)) node.value = selected;
 }
 
+function apChannelState(item) {
+  if (item?.capabilities?.ap_channels?.length) return "known";
+  return item?.ap_channel_state || item?.capabilities?.ap_channel_state || "unknown";
+}
+function apSelectable(item) {
+  if (!item.wireless || !item.ap_capable || item.reserved) return false;
+  if (item.role === "ap") return true;
+  const inferred = item.usable && !item.busy && apChannelState(item) === "known" && Boolean(item.capabilities?.ap_channels?.length);
+  return item.ap_selectable === true || inferred;
+}
+function apUnavailableReason(item) {
+  if (item.reserved) return "Reserved for the PinePi management access point.";
+  if (item.ap_capable && item.busy && item.role !== "ap") return `Busy with ${(item.role || "another operation").replaceAll("_", " ")}.`;
+  if (!item.ap_capable) return "Adapter does not support AP mode.";
+  if (!item.usable) return item.reason || "Adapter is not ready.";
+  if (apChannelState(item) === "unknown") return "Unable to determine supported AP channels.";
+  if (apChannelState(item) === "none") return "Adapter supports AP mode but no usable AP channels are available in the current regulatory domain.";
+  return item.ap_selection_reason || "Adapter is not currently selectable.";
+}
+
 async function loadInterfaces(active = {}) {
   const data = await api(`/interfaces${active.apInterface ? `?ap_interface=${encodeURIComponent(active.apInterface)}` : ""}`);
   state.interfaces = data.interfaces;
   const monitorOk = (item) => item.wireless && item.monitor_capable && !item.reserved && (item.usable || item.role === active.reconRole || item.role === active.captureRole);
-  const apOk = (item) => item.wireless && item.ap_capable && !item.reserved && (item.role === "ap" || (item.usable && item.capabilities?.ap_channels?.length));
   fillSelect($("#reconInterface"), data.interfaces, monitorOk, (item) => `${item.name} — ${item.description}`, "No free monitor-capable adapter", active.reconInterface);
   fillSelect($("#captureInterface"), data.interfaces, monitorOk, (item) => `${item.name} — ${item.description}`, "No free monitor-capable adapter", active.captureInterface);
-  fillSelect($("#apInterface"), data.interfaces, apOk, (item) => `${item.name} — ${item.description}`, "No free AP-capable adapter", active.apInterface);
-  data.interfaces.filter((item) => item.wireless && item.monitor_capable && !item.ap_capable && !item.reserved).forEach((item) => {
-    const unsupported = option(item.name, `${item.name} — monitor only (AP unsupported)`); unsupported.disabled = true; $("#apInterface").append(unsupported);
-  });
-  data.interfaces.filter((item) => item.wireless && item.ap_capable && !item.capabilities?.ap_channels?.length && !item.reserved).forEach((item) => {
-    const unsupported = option(item.name, `${item.name} — no permitted AP channels`); unsupported.disabled = true; $("#apInterface").append(unsupported);
+  fillSelect($("#apInterface"), data.interfaces, apSelectable, (item) => `${item.name} — ${item.description}`, "No selectable AP adapter", active.apInterface);
+  data.interfaces.filter((item) => item.wireless && !apSelectable(item)).forEach((item) => {
+    const unavailable = option(item.name, `${item.name} — ${apUnavailableReason(item)}`); unavailable.disabled = true; $("#apInterface").append(unavailable);
   });
   updateApChannels(active.apChannel);
-  const monitorOnly = data.interfaces.find((item) => item.wireless && item.monitor_capable && !item.ap_capable && !item.reserved);
-  const noChannels = data.interfaces.find((item) => item.wireless && item.ap_capable && !item.capabilities?.ap_channels?.length && !item.reserved);
   const apHint = $("#apCapabilityHint");
-  if (!$("#apInterface").value && monitorOnly) apHint.textContent = "This adapter supports monitor mode but not AP mode.";
-  else if (!$("#apInterface").value && noChannels) apHint.textContent = "This adapter advertises AP mode, but no channels are permitted in the current regulatory domain.";
-  else if (!$("#apInterface").value) apHint.textContent = "No ready adapter currently advertises AP mode.";
-  else apHint.textContent = "";
+  const unavailableAdapters = data.interfaces.filter((item) => item.wireless && !apSelectable(item));
+  const diagnosticAdapter = unavailableAdapters.find((item) => item.ap_capable && item.usable && apChannelState(item) === "unknown")
+    || unavailableAdapters.find((item) => item.ap_capable && item.usable && apChannelState(item) === "none")
+    || unavailableAdapters.find((item) => item.ap_capable && item.busy)
+    || unavailableAdapters[0];
+  apHint.textContent = !$("#apInterface").value && diagnosticAdapter
+    ? apUnavailableReason(diagnosticAdapter)
+    : (!$("#apInterface").value ? "No ready adapter currently supports AP mode." : "");
   const uplink = $("#apUplink"); const selected = active.requestedUplink || uplink.value || "auto"; clear(uplink);
   uplink.append(option("auto", "Automatic"));
   data.uplinks.forEach((item) => uplink.append(option(item.name, `${item.name} — ${item.connectivity ? "Internet route" : "Connected"}`)));
