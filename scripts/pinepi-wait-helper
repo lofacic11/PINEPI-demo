@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+for _attempt in $(seq 1 50); do
+  if [[ -S /run/pinepi/helper.sock && -w /run/pinepi/helper.sock ]]; then
+    exit 0
+  fi
+  sleep 0.1
+done
+
+echo "PinePi helper socket did not become ready." >&2
+exit 1

@@ -1,0 +1,29 @@
+[Unit]
+Description=PinePi privileged wireless helper
+After=network.target
+Before=pinepi.service
+
+[Service]
+Type=simple
+Environment=PINEPI_DATA_DIR=/var/lib/pinepi
+Environment=PINEPI_RUNTIME_DIR=/var/lib/pinepi-system
+Environment=PINEPI_HELPER_SOCKET=/run/pinepi/helper.sock
+ExecStart=/opt/pinepi/.venv/bin/python -m pinepi.helper
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=20
+KillMode=mixed
+User=root
+Group=pinepi
+RuntimeDirectory=pinepi
+RuntimeDirectoryMode=0750
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/pinepi /var/lib/pinepi-system /run/pinepi
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE CAP_KILL CAP_DAC_OVERRIDE CAP_CHOWN CAP_SETUID CAP_SETGID
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE CAP_KILL CAP_DAC_OVERRIDE CAP_CHOWN CAP_SETUID CAP_SETGID
+
+[Install]
+WantedBy=multi-user.target

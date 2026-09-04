@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>PinePi</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
+  <script defer src="{{ url_for('static', filename='app.js') }}"></script>
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar" id="sidebar">
+    <div class="brand"><div class="logo">P</div><span>PinePi</span></div>
+    <nav class="nav" aria-label="Primary navigation">
+      <button class="active" data-page="dashboard"><span aria-hidden="true">▣</span><span>Dashboard</span></button>
+      <button data-page="recon"><span aria-hidden="true">◉</span><span>Recon</span></button>
+      <button data-page="ap"><span aria-hidden="true">◈</span><span>Access Point</span></button>
+      <button data-page="capture"><span aria-hidden="true">▤</span><span>Capture</span></button>
+      <button data-page="logs"><span aria-hidden="true">≡</span><span>Logs</span></button>
+    </nav>
+    <div class="sidebar-bottom"><div>PinePi Prototype v1</div><div class="sidebar-note">Authorized training use only</div></div>
+  </aside>
+  <div class="mobile-overlay" id="overlay"></div>
+
+  <main class="main">
+    <header class="topbar">
+      <div class="top-left">
+        <button class="btn menu-btn" id="menuBtn" aria-label="Open navigation">☰</button>
+        <div class="status"><span class="dot" id="systemDot"></span><span id="systemStatus">Connecting…</span></div>
+      </div>
+      <div class="kpi-row"><span class="inline-stat">Management: <strong>wlan0</strong></span><span class="pill">PinePi</span></div>
+    </header>
+
+    <div class="content">
+      <div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+      <section class="page active" id="dashboard">
+        <div class="page-title"><div><h1>Dashboard</h1><div class="subtitle">System overview and wireless status</div></div></div>
+        <div class="grid grid-5 metrics">
+          <div class="card"><h3>CPU</h3><div class="metric" id="cpuMetric">—</div><div class="metric-label" id="cpuLabel">Loading</div><div class="progress"><span id="cpuBar"></span></div></div>
+          <div class="card"><h3>Memory</h3><div class="metric" id="memoryMetric">—</div><div class="metric-label" id="memoryLabel">Loading</div><div class="progress"><span id="memoryBar"></span></div></div>
+          <div class="card"><h3>Storage</h3><div class="metric" id="storageMetric">—</div><div class="metric-label" id="storageLabel">Loading</div><div class="progress"><span id="storageBar"></span></div></div>
+          <div class="card"><h3>Temperature</h3><div class="metric" id="temperatureMetric">—</div><div class="metric-label">Raspberry Pi</div><div class="progress"><span id="temperatureBar"></span></div></div>
+          <div class="card"><h3>Uptime</h3><div class="metric compact" id="uptimeMetric">—</div><div class="metric-label">Since last boot</div></div>
+        </div>
+        <div class="grid grid-2 block-gap">
+          <div class="card"><h3>Network Interfaces</h3><div id="interfaceList" class="empty">Loading interfaces…</div></div>
+          <div class="card">
+            <h3>Current Operations</h3><div id="operationList" class="empty">Loading operations…</div>
+            <div class="actions action-gap"><button class="btn primary" data-goto="recon">Start Recon</button><button class="btn" data-goto="ap">Create AP</button><button class="btn" data-goto="capture">Capture</button></div>
+          </div>
+        </div>
+        <div class="section-title">Wireless Landscape</div>
+        <div class="grid grid-4">
+          <div class="card"><div class="metric" id="landscapeAps">—</div><div class="metric-label">Access Points</div></div>
+          <div class="card"><div class="metric" id="landscapeClients">—</div><div class="metric-label">Observed Clients</div></div>
+          <div class="card"><div class="metric" id="landscapeOpen">—</div><div class="metric-label">Open Networks</div></div>
+          <div class="card"><div class="metric" id="landscapeChannels">—</div><div class="metric-label">Channels Used</div></div>
+        </div>
+      </section>
+
+      <section class="page" id="recon">
+        <div class="page-title">
+          <div><h1>Recon</h1><div class="subtitle">Discover access points, clients and channel usage</div></div>
+          <div class="actions"><a class="btn disabled" id="reconCsv">Export CSV</a><a class="btn disabled" id="reconJson">Export JSON</a></div>
+        </div>
+        <div class="card">
+          <div class="controls">
+            <div class="field"><label for="reconInterface">Audit Interface</label><select id="reconInterface"></select></div>
+            <div class="field"><label for="reconMode">Scan Mode</label><select id="reconMode"><option value="normal">Normal</option><option value="passive">Passive</option></select></div>
+            <div class="field"><label for="reconSearch">Search</label><input id="reconSearch" placeholder="SSID / BSSID…"></div>
+            <div class="field"><label>&nbsp;</label><button class="btn primary full" id="reconBtn">Start Recon</button></div>
+          </div>
+          <div class="notice" id="reconNotice">Loading Recon state…</div>
+        </div>
+        <div class="grid grid-2 block-gap">
+          <div class="card"><h3>Channel Usage</h3><div id="channelChart" class="empty">No Recon data.</div></div>
+          <div class="card"><h3>Security</h3><div id="securityChart" class="empty">No Recon data.</div></div>
+        </div>
+        <div class="section-title title-row"><span>Detected Networks</span><div class="field compact-field"><label for="reconSession">Session</label><select id="reconSession"><option value="">Latest</option></select></div></div>
+        <div class="table-wrap">
+          <table><thead><tr><th data-sort="ssid">SSID</th><th data-sort="bssid">BSSID</th><th data-sort="channel">CH</th><th data-sort="signal">Signal</th><th data-sort="security">Security</th><th data-sort="client_count">Clients</th><th>Seen</th></tr></thead><tbody id="reconTable"></tbody></table>
+        </div>
+        <div class="mobile-cards" id="reconCards"></div>
+        <div class="card block-gap" id="networkDetail"><h3>Network Details</h3><div class="empty">Select a network to view its observed clients.</div></div>
+      </section>
+
+      <section class="page" id="ap">
+        <div class="page-title"><div><h1>Access Point</h1><div class="subtitle">Create a controlled test network and optionally route client traffic</div></div></div>
+        <div class="grid grid-2">
+          <div class="card"><h3>Access Point</h3>
+            <div class="field"><label for="apInterface">AP Interface</label><select id="apInterface"></select></div>
+            <div class="field field-gap"><label for="apSsid">SSID</label><input id="apSsid" value="PinePi-Test" maxlength="32"></div>
+            <div class="grid grid-2 field-gap">
+              <div class="field"><label for="apChannel">Channel</label><select id="apChannel"><option>1</option><option selected>6</option><option>11</option><option>36</option><option>40</option><option>44</option><option>48</option></select></div>
+              <div class="field"><label for="apSecurity">Security</label><select id="apSecurity"><option value="open">Open</option><option value="wpa2">WPA2-PSK</option></select></div>
+            </div>
+            <div class="field field-gap hidden" id="apPasswordField"><label for="apPassword">Wi-Fi Password</label><div class="input-action"><input id="apPassword" type="text" minlength="8" maxlength="63" autocomplete="off" placeholder="8–63 characters"><button class="btn" id="copyApPassword" type="button">Copy</button></div><div class="subtitle" id="copyStatus"></div></div>
+          </div>
+          <div class="card"><h3>Routing</h3>
+            <div class="field"><label for="apUplink">Uplink Interface</label><select id="apUplink"><option value="auto">Automatic</option><option value="none">No uplink</option></select></div>
+            <div id="uplinkList"></div>
+            <div class="interface"><div><strong>wlan0</strong><small>Reserved management interface</small></div><span class="pill red">Excluded</span></div>
+            <label class="toggle"><input id="apForwarding" type="checkbox" checked> Enable Internet forwarding</label>
+          </div>
+        </div>
+        <div class="card block-gap"><h3>Traffic Monitoring</h3>
+          <label class="toggle"><input id="apLogClients" type="checkbox" checked> Log client connections</label>
+          <label class="toggle"><input id="apCaptureTraffic" type="checkbox"> Capture forwarded AP traffic</label>
+          <div class="field narrow field-gap"><label>Maximum capture size</label><input value="250 MB" disabled></div>
+          <div class="actions field-gap"><button class="btn primary" id="apBtn">Start Access Point</button></div>
+          <div class="notice notice-gap" id="apNotice">Loading Access Point state…</div>
+        </div>
+        <div class="section-title">Connected Clients</div><div class="card"><div class="client-list" id="apClients"><div class="empty">No clients connected.</div></div></div>
+        <div class="section-title">Session History</div><div class="table-wrap"><table><thead><tr><th>SSID</th><th>Started</th><th>Interface</th><th>Uplink</th><th>Status</th><th>Export</th></tr></thead><tbody id="apHistory"></tbody></table></div><div class="mobile-cards" id="apHistoryCards"></div>
+      </section>
+
+      <section class="page" id="capture">
+        <div class="page-title"><div><h1>Capture</h1><div class="subtitle">Manual wireless packet capture and export</div></div></div>
+        <div class="card"><div class="controls">
+          <div class="field"><label for="captureInterface">Interface</label><select id="captureInterface"></select></div>
+          <div class="field"><label for="captureChannel">Channel</label><select id="captureChannel"><option>1</option><option selected>6</option><option>11</option><option>36</option><option>40</option><option>44</option><option>48</option></select></div>
+          <div class="field"><label for="captureName">Capture Name</label><input id="captureName" value="audit_capture" maxlength="64"></div>
+          <div class="field"><label>&nbsp;</label><button class="btn primary full" id="captureBtn">Start Capture</button></div>
+        </div><div class="notice" id="captureNotice">Loading capture state…</div></div>
+        <div class="section-title">Capture History</div><div class="table-wrap"><table><thead><tr><th>Name</th><th>Date</th><th>Duration</th><th>Packets</th><th>Size</th><th>Status</th><th>Actions</th></tr></thead><tbody id="captureHistory"></tbody></table></div><div class="mobile-cards" id="captureCards"></div>
+      </section>
+
+      <section class="page" id="logs">
+        <div class="page-title"><div><h1>Logs</h1><div class="subtitle">System and operation history</div></div><div class="actions"><a class="btn log-export" data-format="txt">TXT</a><a class="btn log-export" data-format="csv">CSV</a><a class="btn log-export" data-format="json">JSON</a></div></div>
+        <div class="card"><div class="controls">
+          <div class="field"><label for="logLevel">Level</label><select id="logLevel"><option value="">All</option><option>INFO</option><option>WARNING</option><option>ERROR</option></select></div>
+          <div class="field"><label for="logComponent">Component</label><select id="logComponent"><option value="">All</option><option value="system">System</option><option value="recon">Recon</option><option value="access_point">Access Point</option><option value="capture">Capture</option><option value="networking">Networking</option><option value="storage">Storage</option></select></div>
+          <div class="field"><label for="logSearch">Search</label><input id="logSearch" placeholder="Search logs…"></div>
+          <div class="field"><label>&nbsp;</label><button class="btn full" id="logApply">Apply</button></div>
+        </div></div>
+        <div class="card block-gap" id="logList"><div class="empty">Loading logs…</div></div>
+      </section>
+    </div>
+  </main>
+</div>
+</body>
+</html>

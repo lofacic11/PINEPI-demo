@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pinepi"
+version = "1.0.0"
+description = "Raspberry Pi wireless audit appliance for authorized training environments"
+requires-python = ">=3.11"
+dependencies = [
+  "Flask>=3.0,<4",
+  "psutil>=5.9,<8",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8,<10"]
+
+[project.scripts]
+pinepi = "pinepi.__main__:main"
+pinepi-helper = "pinepi.helper:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.setuptools.packages.find]
+include = ["pinepi*"]
+
+[tool.setuptools.package-data]
+pinepi = ["templates/*.html", "static/*.css", "static/*.js"]

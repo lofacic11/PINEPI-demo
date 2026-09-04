@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+MANAGEMENT_INTERFACE="wlan0"
+MANAGEMENT_ADDRESS="10.42.0.1/24"
+HOSTAPD_CONFIG="/etc/pinepi/management-hostapd.conf"
+DNSMASQ_CONFIG="/etc/pinepi/management-dnsmasq.conf"
+RUNTIME_DIR="/run/pinepi-management"
+
+cleanup() {
+  if [[ -f "${RUNTIME_DIR}/dnsmasq.pid" ]]; then
+    kill "$(<"${RUNTIME_DIR}/dnsmasq.pid")" 2>/dev/null || true
+  fi
+  if [[ -f "${RUNTIME_DIR}/hostapd.pid" ]]; then
+    kill "$(<"${RUNTIME_DIR}/hostapd.pid")" 2>/dev/null || true
+  fi
+  ip address del "${MANAGEMENT_ADDRESS}" dev "${MANAGEMENT_INTERFACE}" 2>/dev/null || true
+  nmcli device set "${MANAGEMENT_INTERFACE}" managed yes 2>/dev/null || true
+  rm -f "${RUNTIME_DIR}/hostapd.pid" "${RUNTIME_DIR}/dnsmasq.pid"
+}
+
+start() {
+  ip link show dev "${MANAGEMENT_INTERFACE}" >/dev/null
+  install -d -m 0755 "${RUNTIME_DIR}"
+  # Reserve wlan0 from NetworkManager before changing it or starting hostapd.
+  nmcli device set "${MANAGEMENT_INTERFACE}" managed no 2>/dev/null || true
+  ip link set dev "${MANAGEMENT_INTERFACE}" down
+  ip address flush dev "${MANAGEMENT_INTERFACE}"
+  ip address add "${MANAGEMENT_ADDRESS}" dev "${MANAGEMENT_INTERFACE}"
+  ip link set dev "${MANAGEMENT_INTERFACE}" up
+  hostapd -B -P "${RUNTIME_DIR}/hostapd.pid" "${HOSTAPD_CONFIG}"
+  sleep 1
+  iw dev "${MANAGEMENT_INTERFACE}" info | grep -q '^[[:space:]]*type AP$'
+  hostapd_cli -i "${MANAGEMENT_INTERFACE}" status | grep -q '^state=ENABLED$'
+  hostapd_cli -i "${MANAGEMENT_INTERFACE}" status | grep -q '^ssid\[0\]=PinePi$'
+  dnsmasq --conf-file="${DNSMASQ_CONFIG}" --pid-file="${RUNTIME_DIR}/dnsmasq.pid"
+}
+
+case "${1:-}" in
+  start)
+    trap cleanup ERR
+    start
+    ;;
+  stop)
+    cleanup
+    ;;
+  restart)
+    cleanup
+    trap cleanup ERR
+    start
+    ;;
+  *)
+    echo "Usage: $0 {start|stop|restart}" >&2
+    exit 2
+    ;;
+esac

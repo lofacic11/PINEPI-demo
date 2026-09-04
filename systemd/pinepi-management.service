@@ -1,0 +1,16 @@
+[Unit]
+Description=PinePi management wireless network
+After=NetworkManager.service
+Wants=NetworkManager.service
+Before=pinepi.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/lib/pinepi/pinepi-management start
+ExecStop=/usr/local/lib/pinepi/pinepi-management stop
+TimeoutStartSec=20
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target

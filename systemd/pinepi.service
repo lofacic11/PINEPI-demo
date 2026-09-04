@@ -1,0 +1,28 @@
+[Unit]
+Description=PinePi Prototype v1 web service
+After=network.target pinepi-management.service pinepi-helper.service
+Requires=pinepi-management.service pinepi-helper.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/pinepi
+Environment=PINEPI_DATA_DIR=/var/lib/pinepi
+Environment=PINEPI_PORT=8080
+Environment=PINEPI_HELPER_SOCKET=/run/pinepi/helper.sock
+ExecStartPre=/usr/local/lib/pinepi/pinepi-wait-helper
+ExecStart=/opt/pinepi/.venv/bin/python -m pinepi
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=20
+KillMode=mixed
+User=pinepi
+Group=pinepi
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/pinepi
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target
