@@ -1,16 +1,20 @@
 [Unit]
 Description=PinePi management wireless network
-After=NetworkManager.service
-Wants=NetworkManager.service
+After=systemd-rfkill.service NetworkManager.service
+Wants=systemd-rfkill.service NetworkManager.service
 Before=pinepi.service
+StartLimitIntervalSec=300
+StartLimitBurst=3
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=/usr/local/lib/pinepi/pinepi-management start
 ExecStop=/usr/local/lib/pinepi/pinepi-management stop
-TimeoutStartSec=20
+TimeoutStartSec=45
 TimeoutStopSec=15
+Restart=on-failure
+RestartSec=3
 
 [Install]
 WantedBy=multi-user.target

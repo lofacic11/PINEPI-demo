@@ -11,15 +11,19 @@ INSTALL_DIR="/opt/pinepi"
 
 apt-get update
 DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-  python3 python3-venv iw iproute2 network-manager hostapd dnsmasq aircrack-ng tshark nftables
+  python3 python3-venv iw iproute2 network-manager rfkill hostapd dnsmasq aircrack-ng tshark nftables
 
 install -d -m 0755 "${INSTALL_DIR}" /etc/pinepi /usr/local/lib/pinepi
 cp -a "${SOURCE_DIR}/pinepi" "${SOURCE_DIR}/pyproject.toml" "${SOURCE_DIR}/requirements.txt" "${INSTALL_DIR}/"
 python3 -m venv "${INSTALL_DIR}/.venv"
 "${INSTALL_DIR}/.venv/bin/pip" install --disable-pip-version-check --no-cache-dir "${INSTALL_DIR}"
 
-install -m 0644 "${SOURCE_DIR}/config/management-hostapd.conf" /etc/pinepi/management-hostapd.conf
-install -m 0644 "${SOURCE_DIR}/config/management-dnsmasq.conf" /etc/pinepi/management-dnsmasq.conf
+if [[ ! -e /etc/pinepi/management-hostapd.conf ]]; then
+  install -m 0644 "${SOURCE_DIR}/config/management-hostapd.conf" /etc/pinepi/management-hostapd.conf
+fi
+if [[ ! -e /etc/pinepi/management-dnsmasq.conf ]]; then
+  install -m 0644 "${SOURCE_DIR}/config/management-dnsmasq.conf" /etc/pinepi/management-dnsmasq.conf
+fi
 install -m 0755 "${SOURCE_DIR}/scripts/pinepi-management" /usr/local/lib/pinepi/pinepi-management
 install -m 0755 "${SOURCE_DIR}/scripts/pinepi-wait-helper" /usr/local/lib/pinepi/pinepi-wait-helper
 install -m 0644 "${SOURCE_DIR}/systemd/pinepi-management.service" /etc/systemd/system/pinepi-management.service

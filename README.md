@@ -30,7 +30,7 @@ The application uses Flask and SQLite. `OperationService` owns explicit operatio
 
 Transient process identities, interfaces requiring restoration, and nftables forwarding state are recorded in the root-owned `/var/lib/pinepi-system`. Startup reconciliation checks recorded command identities defensively, terminates only matching PinePi processes, restores external radios, removes only `pinepi_*` nftables tables, restores the prior forwarding value, clears ownership, and marks interrupted database sessions. `wlan0` is never treated as a stale audit radio.
 
-The management WLAN is a separate systemd oneshot service, starts before the web service, and reserves `wlan0` in NetworkManager before hostapd starts. A separate `pinepi-helper` service owns transient system processes and network changes. Test-AP startup does not report success until the radio reports AP mode and hostapd confirms both `ENABLED` and the requested SSID.
+The management WLAN is a separate systemd oneshot service. Its bounded boot-readiness loop waits for `wlan0`, clears the system-wide Wi-Fi soft block, verifies the management PHY, and raises the interface before reserving `wlan0` in NetworkManager and starting hostapd/dnsmasq. Failed early-boot attempts are retried by systemd with rate limiting. The web service is ordered after management startup but is not failed by a transient management-radio error; it remains available when the management address appears after recovery. A separate `pinepi-helper` service owns transient system processes and network changes. Test-AP startup does not report success until the radio reports AP mode and hostapd confirms both `ENABLED` and the requested SSID.
 
 ## Raspberry Pi installation
 
@@ -45,7 +45,7 @@ iw dev
 
 Then connect a client to the open `PinePi` WLAN and open `http://10.42.0.1:8080/`.
 
-The installer installs only runtime tools used by the implementation: Python/venv, NetworkManager, iw/iproute2, hostapd, dnsmasq, aircrack-ng, tshark/dumpcap, and nftables. It records then disables the distro-wide hostapd/dnsmasq units so PinePi's dedicated instances cannot conflict; uninstall restores units that were previously enabled or active. Application data lives under `/var/lib/pinepi`. Default storage values can be overridden in the service environment with `PINEPI_MAX_CAPTURE_BYTES` and `PINEPI_MIN_FREE_BYTES`.
+The installer installs only runtime tools used by the implementation: Python/venv, NetworkManager, rfkill, iw/iproute2, hostapd, dnsmasq, aircrack-ng, tshark/dumpcap, and nftables. It records then disables the distro-wide hostapd/dnsmasq units so PinePi's dedicated instances cannot conflict; uninstall restores units that were previously enabled or active. Application data lives under `/var/lib/pinepi`. Default storage values can be overridden in the service environment with `PINEPI_MAX_CAPTURE_BYTES` and `PINEPI_MIN_FREE_BYTES`.
 
 After editing code, reinstall to refresh `/opt/pinepi`, or run a development instance in a venv:
 
@@ -73,6 +73,19 @@ git diff --check
 ```
 
 On Raspberry Pi hardware, verify both radios and modes (`iw list`), management-WLAN recovery after reboot, Recon/Capture restoration to managed mode, hostapd/dnsmasq operation, client DHCP, Internet routing, nftables cleanup, storage-limit stops, and recovery after forcibly interrupting each operation.
+
+For the management boot acceptance test, first run `sudo reboot` and do not issue any manual recovery command. After the Pi has completed booting, run:
+
+```bash
+rfkill list
+sudo systemctl status pinepi-management pinepi-helper pinepi --no-pager -l
+sudo journalctl -b -u pinepi-management --no-pager
+iw dev
+ip -br addr
+nmcli device status
+```
+
+Expected results are an unblocked `wlan0` in AP mode with SSID `PinePi` and address `10.42.0.1/24`, all three PinePi services active, and `http://10.42.0.1:8080/` reachable from a client associated with the management WLAN.
 
 ## Uninstall
 

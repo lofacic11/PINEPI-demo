@@ -1,7 +1,8 @@
 [Unit]
 Description=PinePi Prototype v1 web service
 After=network.target pinepi-management.service pinepi-helper.service
-Requires=pinepi-management.service pinepi-helper.service
+Wants=pinepi-management.service
+Requires=pinepi-helper.service
 
 [Service]
 Type=simple
