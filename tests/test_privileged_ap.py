@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import ipaddress
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from pinepi.errors import PinePiError
-from pinepi.privileged import PrivilegedService, parse_iw_ap_channels
+from pinepi.privileged import OwnedProcess, PrivilegedService, parse_iw_ap_channels
 
 
 class ProcessStub:
@@ -33,7 +34,11 @@ def ap_service(tmp_path, monkeypatch, mode_before="managed", final_mode="AP", fi
 
     def runner(argv, **_kwargs):
         calls.append(list(argv))
-        stdout = status if argv[0] == "hostapd_cli" else ""
+        if argv[:6] == ["ip", "-o", "-4", "address", "show", "dev"]:
+            interface = argv[-1]
+            stdout = f"7: {interface}    inet 10.77.0.1/24 scope global {interface}\n"
+        else:
+            stdout = status if argv[0] == "hostapd_cli" else ""
         return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
 
     service = PrivilegedService(tmp_path / "runtime", runner=runner)
@@ -154,7 +159,7 @@ def test_hostapd_early_exit_reports_captured_reason(tmp_path, monkeypatch):
     assert "d" * 32 + "-hostapd" in stopped
 
 
-def test_dnsmasq_early_exit_reports_output_and_stops_both_processes(tmp_path, monkeypatch):
+def test_dnsmasq_early_exit_reports_output_and_stops_both_processes(tmp_path, monkeypatch, capsys):
     service, _calls, _spawned, stopped = ap_service(tmp_path, monkeypatch)
     started = []
 
@@ -174,8 +179,141 @@ def test_dnsmasq_early_exit_reports_output_and_stops_both_processes(tmp_path, mo
     assert error.value.code == "DNSMASQ_START_FAILED"
     assert "Address already in use" in error.value.message
     assert error.value.details["dnsmasq_status"] == "exited"
+    assert error.value.details["stage"] == "dnsmasq_start"
+    assert error.value.details["interface"] == "wlan1"
+    assert error.value.details["gateway_ip"] == "10.77.0.1"
+    assert error.value.details["subnet"] == "10.77.0.0/24"
+    assert error.value.details["dhcp_start"] == "10.77.0.10"
+    assert error.value.details["dhcp_end"] == "10.77.0.200"
+    assert error.value.details["listen_address"] == "10.77.0.1"
+    assert error.value.details["dns_listen_addresses"] == ["10.77.0.1"]
+    assert error.value.details["pid"] == 4321
+    assert error.value.details["exit_code"] == 2
+    assert "Address already in use" in error.value.details["stderr"]
     assert set(started) == {"1" * 32 + "-hostapd", "1" * 32 + "-dnsmasq"}
     assert set(stopped) == set(started)
+    assert not (session_dir / "dnsmasq-state" / "dnsmasq.pid").exists()
+    assert not (session_dir / "dnsmasq-state" / "dnsmasq.leases").exists()
+    diagnostic = capsys.readouterr().out
+    assert "stage=dnsmasq_start interface=wlan1" in diagnostic
+    assert "listen_address=10.77.0.1 dns_listen_addresses=[\"10.77.0.1\"]" in diagnostic
+    assert "pid=4321 exit_code=2 result=failure" in diagnostic
+
+
+@pytest.mark.parametrize("interface", ["wlan1", "wlan2"])
+def test_temporary_dnsmasq_binds_only_ap_interface_and_gateway(tmp_path, interface):
+    service = PrivilegedService(tmp_path / "runtime")
+    session_dir = tmp_path / interface
+    session_dir.mkdir()
+
+    config_path = service._write_dnsmasq_config(interface, session_dir)
+    lines = config_path.read_text(encoding="utf-8").splitlines()
+
+    assert f"interface={interface}" in lines
+    assert "except-interface=lo" in lines
+    assert "bind-interfaces" in lines
+    assert "listen-address=10.77.0.1" in lines
+    assert "interface=wlan0" not in lines
+    assert not any(
+        address in line
+        for line in lines
+        for address in ("127.0.0.1", "::1", "0.0.0.0")
+    )
+    subnet = ipaddress.ip_network("10.77.0.0/24")
+    for address in ("10.77.0.1", "10.77.0.10", "10.77.0.200"):
+        assert ipaddress.ip_address(address) in subnet
+
+
+def test_management_and_temporary_dnsmasq_configs_are_disjoint(tmp_path):
+    management = (Path(__file__).parents[1] / "config" / "management-dnsmasq.conf").read_text(
+        encoding="utf-8"
+    )
+    service = PrivilegedService(tmp_path / "runtime")
+    session_dir = tmp_path / "session"
+    session_dir.mkdir()
+    temporary = service._write_dnsmasq_config("wlan1", session_dir).read_text(encoding="utf-8")
+
+    assert "interface=wlan0" in management
+    assert "interface=wlan1" in temporary
+    assert "except-interface=lo" in temporary
+    assert "listen-address=10.77.0.1" in temporary
+    assert "10.42.0.1" not in temporary
+
+    management_listeners = {"127.0.0.1", "::1", "10.42.0.1"}
+    temporary_listeners = {
+        line.split("=", 1)[1]
+        for line in temporary.splitlines()
+        if line.startswith("listen-address=")
+    }
+    assert temporary_listeners == {"10.77.0.1"}
+    assert management_listeners.isdisjoint(temporary_listeners)
+
+
+def test_ap_gateway_is_verified_before_dnsmasq_start(tmp_path, monkeypatch):
+    service, calls, spawned, _stopped = ap_service(tmp_path, monkeypatch)
+    session_dir = tmp_path / "session"
+    session_dir.mkdir()
+
+    service.start_ap("wlan2", "PinePi-Test", 6, "open", None, session_dir, "2" * 32)
+
+    address_probe = ["ip", "-o", "-4", "address", "show", "dev", "wlan2"]
+    assert address_probe in calls
+    assert spawned[-1][0][0] == "dnsmasq"
+    assert calls.index(address_probe) > calls.index(
+        ["ip", "address", "add", "10.77.0.1/24", "dev", "wlan2"]
+    )
+
+
+def test_missing_ap_gateway_prevents_dnsmasq_and_cleans_temporary_state(tmp_path, monkeypatch):
+    service, _calls, spawned, stopped = ap_service(tmp_path, monkeypatch)
+    original_runner = service._runner
+
+    def runner(argv, **kwargs):
+        result = original_runner(argv, **kwargs)
+        if argv[:6] == ["ip", "-o", "-4", "address", "show", "dev"]:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        return result
+
+    service._runner = runner
+    session_dir = tmp_path / "session"
+    session_dir.mkdir()
+
+    with pytest.raises(PinePiError) as error:
+        service.start_ap("wlan1", "PinePi-Test", 6, "open", None, session_dir, "3" * 32)
+
+    assert error.value.code == "AP_ADDRESS_FAILED"
+    assert error.value.details["stage"] == "address_verification"
+    assert all(argv[0][0] != "dnsmasq" for argv in spawned)
+    assert "3" * 32 + "-hostapd" in stopped
+    assert not (session_dir / "dnsmasq-state" / "dnsmasq.leases").exists()
+
+
+def test_stopping_owned_ap_dnsmasq_removes_only_temporary_pid_and_leases(tmp_path):
+    class FinishedProcess:
+        pid = 9876
+
+        @staticmethod
+        def poll():
+            return 0
+
+    service = PrivilegedService(tmp_path / "runtime")
+    session_dir = tmp_path / "session"
+    state_dir = session_dir / "dnsmasq-state"
+    state_dir.mkdir(parents=True)
+    config_path = session_dir / "dnsmasq.conf"
+    config_path.write_text("interface=wlan1\n", encoding="utf-8")
+    (state_dir / "dnsmasq.pid").write_text("9876\n", encoding="utf-8")
+    (state_dir / "dnsmasq.leases").write_text("temporary lease\n", encoding="utf-8")
+    process = OwnedProcess(
+        FinishedProcess(),
+        ("dnsmasq", "--keep-in-foreground", f"--conf-file={config_path}"),
+        "4" * 32 + "-dnsmasq",
+    )
+
+    service.stop_process(process)
+
+    assert config_path.exists()
+    assert not state_dir.exists()
 
 
 def test_rfkill_failure_and_adapter_disappearance_are_specific(tmp_path, monkeypatch):

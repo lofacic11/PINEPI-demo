@@ -115,6 +115,36 @@ def test_ap_stop_removes_routing_and_restores_interface(service):
     assert registry.snapshot() == {}
 
 
+@pytest.mark.parametrize("interface", ["wlan1", "wlan2"])
+def test_repeated_ap_cycles_stop_only_temporary_processes_and_restore_adapter(service, interface):
+    operations, privileged, registry, _db = service
+
+    for _ in range(2):
+        started = operations.start_ap({
+            "interface": interface,
+            "ssid": f"PinePi-{interface}",
+            "channel": 6,
+            "security": "open",
+            "forwarding": False,
+        })
+        operation_id = started["session_id"]
+        assert registry.role(interface) == "ap"
+
+        operations.stop_ap()
+
+        stopped_ids = [call[1] for call in privileged.calls if call[0] == "stop"]
+        assert operation_id + "-dnsmasq" in stopped_ids
+        assert operation_id + "-hostapd" in stopped_ids
+        assert registry.snapshot() == {}
+
+    assert privileged.calls.count(("restore", interface)) == 2
+    assert all(
+        call[1] is None or not call[1].startswith("pinepi-management")
+        for call in privileged.calls
+        if call[0] == "stop"
+    )
+
+
 def test_wlan0_cannot_be_an_uplink(service):
     operations, _privileged, registry, _db = service
     with pytest.raises(PinePiError) as error:

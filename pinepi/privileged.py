@@ -24,6 +24,13 @@ IW_FREQUENCY_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+AP_SUBNET = "10.77.0.0/24"
+AP_GATEWAY_IP = "10.77.0.1"
+AP_GATEWAY_CIDR = f"{AP_GATEWAY_IP}/24"
+AP_DHCP_START = "10.77.0.10"
+AP_DHCP_END = "10.77.0.200"
+AP_NETMASK = "255.255.255.0"
+
 
 def parse_iw_ap_channels(output: str) -> dict:
     """Parse AP-usable channels from integer or decimal ``iw phy`` frequencies."""
@@ -316,6 +323,14 @@ class PrivilegedService:
                     owned.process.kill()
                 owned.process.wait(timeout=2)
         self.forget_process(owned.operation_id)
+        if owned.operation_id.endswith("-dnsmasq"):
+            config_argument = next(
+                (value for value in owned.argv if value.startswith("--conf-file=")), None,
+            )
+            if config_argument:
+                config_path = Path(config_argument.split("=", 1)[1])
+                if config_path.name == "dnsmasq.conf":
+                    self._clear_ap_dnsmasq_state(config_path.parent)
 
     def wireless_info(self, interface: str) -> dict:
         if not INTERFACE_PATTERN.fullmatch(interface):
@@ -734,7 +749,7 @@ class PrivilegedService:
 
             diagnostics["stage"] = "address_configuration"
             self.run(
-                ["ip", "address", "add", "10.77.0.1/24", "dev", interface],
+                ["ip", "address", "add", AP_GATEWAY_CIDR, "dev", interface],
                 error_code="AP_ADDRESS_FAILED", error_message=f"Failed to assign the AP address to {interface}.",
                 stage="address_configuration",
             )
@@ -744,26 +759,80 @@ class PrivilegedService:
                 stage="address_configuration",
             )
 
-            diagnostics["stage"] = "dnsmasq_start"
-            dnsmasq = self.spawn(
-                ["dnsmasq", "--keep-in-foreground", "--conf-file=" + str(dnsmasq_conf)],
-                operation_id + "-dnsmasq", capture_output=True,
+            address_result = self.run(
+                ["ip", "-o", "-4", "address", "show", "dev", interface], check=False,
             )
+            address_output = self._bounded_text(address_result.stdout)
+            diagnostics.update({
+                "stage": "address_verification", "gateway_ip": AP_GATEWAY_IP,
+                "gateway_cidr": AP_GATEWAY_CIDR, "subnet": AP_SUBNET,
+                "dhcp_start": AP_DHCP_START, "dhcp_end": AP_DHCP_END,
+                "listen_address": AP_GATEWAY_IP,
+                "dns_listen_addresses": [AP_GATEWAY_IP],
+                "address_probe_exit": address_result.returncode,
+                "address_probe_output": address_output,
+                "address_probe_stderr": self._bounded_text(address_result.stderr),
+            })
+            address_present = re.search(
+                rf"\binet\s+{re.escape(AP_GATEWAY_CIDR)}(?:\s|$)", address_output,
+            ) is not None
+            if address_result.returncode != 0 or not address_present:
+                self._log_ap_network_stage("address_verification", diagnostics, result="failure")
+                raise PinePiError(
+                    "AP_ADDRESS_FAILED",
+                    f"The expected AP gateway address {AP_GATEWAY_CIDR} was not present on {interface}.",
+                    500,
+                    diagnostics,
+                )
+            self._log_ap_network_stage("address_verification", diagnostics, result="success")
+
+            diagnostics.update({
+                "stage": "dnsmasq_start", "pid": None, "exit_code": None,
+                "stderr": "", "dnsmasq_status": "starting",
+            })
+            try:
+                dnsmasq = self.spawn(
+                    ["dnsmasq", "--keep-in-foreground", "--conf-file=" + str(dnsmasq_conf)],
+                    operation_id + "-dnsmasq", capture_output=True,
+                )
+            except PinePiError as exc:
+                stderr = self._bounded_text(str(exc.details.get("stderr") or exc.message), 1024)
+                diagnostics.update({
+                    "dnsmasq_status": "spawn_failed", "exit_code": exc.details.get("exit_code"),
+                    "stderr": stderr, "dnsmasq_exit": exc.details.get("exit_code"),
+                    "dnsmasq_output": stderr,
+                })
+                self._log_ap_network_stage("dnsmasq_start", diagnostics, result="failure")
+                raise PinePiError(
+                    "DNSMASQ_START_FAILED",
+                    f"dnsmasq failed to start on {interface}: {self._last_output_line(stderr)}.",
+                    500,
+                    diagnostics,
+                ) from exc
+            diagnostics["pid"] = dnsmasq.pid
             time.sleep(0.5)
             if not dnsmasq.alive():
+                stderr = self._bounded_text(dnsmasq.output(), 1024)
                 diagnostics.update({
                     "dnsmasq_exit": dnsmasq.returncode, "dnsmasq_status": "exited",
-                    "dnsmasq_output": self._bounded_text(dnsmasq.output()),
+                    "dnsmasq_output": stderr, "exit_code": dnsmasq.returncode,
+                    "stderr": stderr,
                 })
+                self._log_ap_network_stage("dnsmasq_start", diagnostics, result="failure")
                 reason = self._last_output_line(dnsmasq.output())
                 message = f"dnsmasq failed to start on {interface}" + (f": {reason}" if reason else "")
                 raise PinePiError("DNSMASQ_START_FAILED", message + ".", 500, diagnostics)
-            diagnostics["dnsmasq_status"] = "running"
+            diagnostics.update({
+                "dnsmasq_status": "running", "exit_code": None,
+                "stderr": self._bounded_text(dnsmasq.output(), 1024),
+            })
+            self._log_ap_network_stage("dnsmasq_start", diagnostics, result="success")
             hostapd_conf.unlink(missing_ok=True)
             return hostapd, dnsmasq
         except Exception as exc:
             self.stop_process(dnsmasq)
             self.stop_process(hostapd)
+            self._clear_ap_dnsmasq_state(session_dir)
             if hostapd is not None:
                 diagnostics["hostapd_exit"] = hostapd.returncode
                 diagnostics["hostapd_output"] = self._bounded_text(hostapd.output())
@@ -811,12 +880,50 @@ class PrivilegedService:
         path = session_dir / "dnsmasq.conf"
         path.write_text(
             "\n".join([
-                f"interface={interface}", "bind-interfaces", "dhcp-range=10.77.0.10,10.77.0.200,255.255.255.0,12h",
-                "dhcp-option=3,10.77.0.1", "dhcp-option=6,10.77.0.1", f"dhcp-leasefile={leases}",
+                f"interface={interface}", "except-interface=lo", "bind-interfaces",
+                f"listen-address={AP_GATEWAY_IP}",
+                f"dhcp-range={AP_DHCP_START},{AP_DHCP_END},{AP_NETMASK},12h",
+                f"dhcp-option=3,{AP_GATEWAY_IP}", f"dhcp-option=6,{AP_GATEWAY_IP}",
+                f"dhcp-leasefile={leases}",
                 f"pid-file={lease_dir / 'dnsmasq.pid'}", "log-dhcp",
             ]) + "\n", encoding="utf-8",
         )
         return path
+
+    @staticmethod
+    def _clear_ap_dnsmasq_state(session_dir: Path) -> None:
+        state_dir = session_dir / "dnsmasq-state"
+        for name in ("dnsmasq.pid", "dnsmasq.leases"):
+            (state_dir / name).unlink(missing_ok=True)
+        try:
+            state_dir.rmdir()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            # Keep unexpected files for diagnosis; never recursively remove session data.
+            pass
+
+    @staticmethod
+    def _log_ap_network_stage(stage: str, diagnostics: dict, *, result: str) -> None:
+        stderr = str(diagnostics.get("stderr") or diagnostics.get("address_probe_stderr") or "")
+        fields = (
+            f"interface={diagnostics.get('interface', 'unknown')}",
+            f"gateway_ip={diagnostics.get('gateway_ip', AP_GATEWAY_IP)}",
+            f"subnet={diagnostics.get('subnet', AP_SUBNET)}",
+            f"dhcp_start={diagnostics.get('dhcp_start', AP_DHCP_START)}",
+            f"dhcp_end={diagnostics.get('dhcp_end', AP_DHCP_END)}",
+            f"listen_address={diagnostics.get('listen_address', AP_GATEWAY_IP)}",
+            "dns_listen_addresses="
+            f"{json.dumps(diagnostics.get('dns_listen_addresses') or [AP_GATEWAY_IP], separators=(',', ':'))}",
+            f"pid={diagnostics.get('pid', 'none')}",
+            f"exit_code={diagnostics.get('exit_code', 'none')}",
+            f"result={result}",
+            f"stderr={json.dumps(stderr[-1024:], separators=(',', ':'))}",
+        )
+        try:
+            print(f"pinepi-helper stage={stage} {' '.join(fields)}", flush=True)
+        except OSError:
+            pass
 
     @staticmethod
     def _key_value_output(value: str) -> dict[str, str]:
@@ -878,7 +985,7 @@ class PrivilegedService:
             self.run(["nft", "add", "table", "inet", table])
             self.run(["nft", "add", "chain", "inet", table, "forward", "{ type filter hook forward priority 0; policy accept; }"])
             self.run(["nft", "add", "chain", "inet", table, "postrouting", "{ type nat hook postrouting priority 100; }"])
-            self.run(["nft", "add", "rule", "inet", table, "postrouting", "oifname", uplink, "ip", "saddr", "10.77.0.0/24", "masquerade"])
+            self.run(["nft", "add", "rule", "inet", table, "postrouting", "oifname", uplink, "ip", "saddr", AP_SUBNET, "masquerade"])
             state = {"table": table, "previous_forwarding": previous, "operation_id": operation_id}
             (self.runtime_dir / f"routing-{operation_id}.json").write_text(json.dumps(state), encoding="utf-8")
         # Roll back every partial nft/sysctl failure, including an injected runner failure.
