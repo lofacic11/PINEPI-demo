@@ -7,10 +7,12 @@ import os
 import re
 import signal
 import subprocess
+import threading
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import BinaryIO
 
 from .adapters import INTERFACE_PATTERN, MANAGEMENT_INTERFACE
 from .errors import PinePiError
@@ -28,6 +30,7 @@ class OwnedProcess:
     process: subprocess.Popen
     argv: tuple[str, ...]
     operation_id: str
+    _output: _BoundedProcessOutput | None = field(default=None, repr=False)
 
     @property
     def pid(self) -> int:
@@ -35,6 +38,43 @@ class OwnedProcess:
 
     def alive(self) -> bool:
         return self.process.poll() is None
+
+    @property
+    def returncode(self) -> int | None:
+        return self.process.poll()
+
+    def output(self) -> str:
+        return self._output.text() if self._output else ""
+
+
+class _BoundedProcessOutput:
+    """Drain a child pipe continuously while retaining only its final bounded output."""
+
+    def __init__(self, stream: BinaryIO, limit: int = 64 * 1024):
+        self.stream = stream
+        self.limit = limit
+        self._data = bytearray()
+        self._lock = threading.Lock()
+        threading.Thread(target=self._drain, name="pinepi-process-output", daemon=True).start()
+
+    def _drain(self) -> None:
+        try:
+            while True:
+                chunk = self.stream.read(4096)
+                if not chunk:
+                    return
+                if isinstance(chunk, str):
+                    chunk = chunk.encode("utf-8", "replace")
+                with self._lock:
+                    self._data.extend(chunk)
+                    if len(self._data) > self.limit:
+                        del self._data[: len(self._data) - self.limit]
+        except (OSError, ValueError):
+            return
+
+    def text(self) -> str:
+        with self._lock:
+            return bytes(self._data).decode("utf-8", "replace")
 
 
 class PrivilegedService:
@@ -59,7 +99,40 @@ class PrivilegedService:
             raise PinePiError("MANAGEMENT_INTERFACE_RESERVED", "wlan0 is reserved for management.", 409)
         return value
 
-    def run(self, argv: list[str], check: bool = True, timeout: int | None = None) -> CommandResult:
+    @staticmethod
+    def _bounded_text(value: str, limit: int = 4096) -> str:
+        value = value.strip()
+        return value[-limit:] if len(value) > limit else value
+
+    @staticmethod
+    def _interface_from_command(argv: list[str]) -> str | None:
+        for marker in ("dev", "device", "-i"):
+            if marker in argv:
+                index = argv.index(marker) + 1
+                if index < len(argv) and INTERFACE_PATTERN.fullmatch(argv[index]):
+                    return argv[index]
+        return next((value for value in argv[1:] if INTERFACE_PATTERN.fullmatch(value) and value.startswith(("wl", "wlan"))), None)
+
+    def _command_failure_message(self, argv: list[str], base: str, stderr: str) -> str:
+        reason = self._last_output_line(stderr)
+        lower = stderr.lower()
+        interface = self._interface_from_command(argv)
+        if interface and any(marker in lower for marker in ("cannot find device", "no such device", "does not exist", "not found")):
+            return f"{interface} disappeared during the operation."
+        if "rfkill" in lower or "rf-kill" in lower:
+            return f"{base.rstrip('.')}: interface is rfkill blocked."
+        return f"{base.rstrip('.')}: {reason}" if reason else base
+
+    def run(
+        self,
+        argv: list[str],
+        check: bool = True,
+        timeout: int | None = None,
+        *,
+        error_code: str = "SYSTEM_COMMAND_FAILED",
+        error_message: str | None = None,
+        stage: str | None = None,
+    ) -> CommandResult:
         try:
             result = self._runner(
                 argv,
@@ -71,35 +144,75 @@ class PrivilegedService:
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
             if check:
-                raise PinePiError("SYSTEM_COMMAND_FAILED", f"Required system operation failed: {argv[0]}.", 500) from exc
+                stderr = self._bounded_text(str(exc))
+                details = {
+                    "stage": stage,
+                    "command": argv[0],
+                    "arguments": argv[1:],
+                    "exit_code": None,
+                    "stderr": stderr,
+                }
+                raise PinePiError(
+                    error_code,
+                    self._command_failure_message(argv, error_message or f"Required system operation failed: {argv[0]}.", stderr),
+                    500,
+                    {key: value for key, value in details.items() if value is not None},
+                ) from exc
             return CommandResult(127, "", str(exc))
         wrapped = CommandResult(result.returncode, result.stdout or "", result.stderr or "")
         if check and result.returncode != 0:
+            stderr = self._bounded_text(wrapped.stderr)
+            message = self._command_failure_message(argv, error_message or f"{argv[0]} failed.", stderr)
             raise PinePiError(
-                "SYSTEM_COMMAND_FAILED", f"{argv[0]} failed.", 500, {"tool": argv[0], "returncode": result.returncode}
+                error_code,
+                message,
+                500,
+                {key: value for key, value in {
+                    "stage": stage,
+                    "command": argv[0],
+                    "arguments": argv[1:],
+                    "exit_code": result.returncode,
+                    "stderr": stderr,
+                }.items() if value is not None},
             )
         return wrapped
 
-    def spawn(self, argv: list[str], operation_id: str, stdout_path: Path | None = None) -> OwnedProcess:
-        stdout = subprocess.DEVNULL
+    def spawn(
+        self,
+        argv: list[str],
+        operation_id: str,
+        stdout_path: Path | None = None,
+        capture_output: bool = False,
+    ) -> OwnedProcess:
+        stdout = subprocess.PIPE if capture_output else subprocess.DEVNULL
         file_handle = None
         if stdout_path:
             stdout_path.parent.mkdir(parents=True, exist_ok=True)
             file_handle = stdout_path.open("ab", buffering=0)
             stdout = file_handle
         try:
-            process = self._popen(
-                argv,
-                shell=False,
-                stdin=subprocess.DEVNULL,
-                stdout=stdout,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
-            )
+            try:
+                process = self._popen(
+                    argv,
+                    shell=False,
+                    stdin=subprocess.DEVNULL,
+                    stdout=stdout,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                )
+            except OSError as exc:
+                raise PinePiError(
+                    "PROCESS_START_FAILED", f"Failed to start {argv[0]}: {exc}.", 500,
+                    {
+                        "stage": f"{Path(argv[0]).name}_start", "command": argv[0],
+                        "arguments": argv[1:], "exit_code": None, "stderr": self._bounded_text(str(exc)),
+                    },
+                ) from exc
         finally:
             if file_handle:
                 file_handle.close()
-        owned = OwnedProcess(process, tuple(argv), operation_id)
+        output = _BoundedProcessOutput(process.stdout) if capture_output and process.stdout is not None else None
+        owned = OwnedProcess(process, tuple(argv), operation_id, output)
         self._record_process(owned)
         return owned
 
@@ -142,14 +255,125 @@ class PrivilegedService:
 
     def wireless_capabilities(self, interface: str) -> dict:
         if not INTERFACE_PATTERN.fullmatch(interface):
-            return {"monitor": False, "ap": False}
+            return {"known": False, "managed": False, "monitor": False, "ap": False, "ap_channels": [], "reason": "Invalid interface name."}
         info = self.wireless_info(interface)
         wiphy = info.get("wiphy")
         if wiphy is None:
-            return {"monitor": False, "ap": False}
+            return {
+                "known": False, "managed": False, "monitor": False, "ap": False, "ap_channels": [],
+                "reason": "Waiting for nl80211 to expose wireless capabilities.",
+            }
         result = self.run(["iw", "phy", f"phy{wiphy}", "info"], check=False)
+        if result.returncode != 0:
+            return {
+                "known": False, "managed": False, "monitor": False, "ap": False, "ap_channels": [],
+                "reason": self._bounded_text(result.stderr) or "Unable to read nl80211 capabilities.",
+            }
         text = result.stdout.lower()
-        return {"monitor": "* monitor" in text, "ap": "* ap" in text}
+        channels: list[int] = []
+        for line in result.stdout.splitlines():
+            match = re.search(r"\*\s+\d+\s+MHz\s+\[([0-9]+)\](.*)$", line, re.IGNORECASE)
+            if match and "disabled" not in match.group(2).lower() and "no ir" not in match.group(2).lower():
+                channels.append(int(match.group(1)))
+        return {
+            "known": True,
+            "managed": bool(re.search(r"^\s*\*\s+managed\s*$", text, re.MULTILINE)),
+            "monitor": bool(re.search(r"^\s*\*\s+monitor\s*$", text, re.MULTILINE)),
+            "ap": bool(re.search(r"^\s*\*\s+ap\s*$", text, re.MULTILINE)),
+            "ap_channels": sorted(set(channels)),
+            "regulatory_domain": self.regulatory_domain(),
+            "wiphy": f"phy{wiphy}",
+        }
+
+    def regulatory_domain(self) -> str:
+        result = self.run(["iw", "reg", "get"], check=False)
+        match = re.search(r"^country\s+([A-Z0-9]{2}):", result.stdout, re.MULTILINE | re.IGNORECASE)
+        return match.group(1).upper() if match else "unknown"
+
+    def networkmanager_state(self, interface: str) -> str:
+        return str(self.networkmanager_details(interface)["state"])
+
+    def networkmanager_details(self, interface: str) -> dict:
+        if not INTERFACE_PATTERN.fullmatch(interface):
+            return {"state": "unknown", "managed": None}
+        result = self.run(["nmcli", "-g", "GENERAL.STATE,GENERAL.NM-MANAGED", "device", "show", interface], check=False)
+        if result.returncode != 0:
+            fallback = self.run(["nmcli", "-g", "GENERAL.STATE", "device", "show", interface], check=False)
+            if fallback.returncode != 0:
+                return {"state": "unavailable", "managed": None, "error": self._bounded_text(fallback.stderr or result.stderr)}
+            result = fallback
+        lines = result.stdout.splitlines()
+        value = lines[0].strip() if lines else ""
+        match = re.match(r"\d+\s*\(([^)]+)\)", value)
+        managed_value = lines[1].strip().lower() if len(lines) > 1 else ""
+        state = (match.group(1) if match else value or "unknown").lower()
+        managed = managed_value in {"yes", "true"} if managed_value else (False if state == "unmanaged" else None)
+        return {"state": state, "managed": managed}
+
+    def rfkill_state(self, interface: str) -> dict:
+        info = self.wireless_info(interface)
+        wiphy = info.get("wiphy")
+        result = self.run(["rfkill", "list"], check=False)
+        state = {"available": result.returncode == 0, "soft_blocked": None, "hard_blocked": None}
+        if result.returncode != 0:
+            state["error"] = self._bounded_text(result.stderr)
+            return state
+        blocks = re.split(r"(?m)(?=^\d+:\s)", result.stdout)
+        target = next((block for block in blocks if wiphy and f"phy{wiphy}" in block), None)
+        if target is None:
+            target = next((block for block in blocks if "Wireless LAN" in block), "")
+        soft = re.search(r"Soft blocked:\s*(yes|no)", target, re.IGNORECASE)
+        hard = re.search(r"Hard blocked:\s*(yes|no)", target, re.IGNORECASE)
+        state["soft_blocked"] = soft.group(1).lower() == "yes" if soft else None
+        state["hard_blocked"] = hard.group(1).lower() == "yes" if hard else None
+        return state
+
+    def _unblock_wireless(self, interface: str, stage: str) -> dict:
+        state = self.rfkill_state(interface)
+        if state.get("hard_blocked"):
+            raise PinePiError(
+                "RFKILL_BLOCKED", f"{interface} is hardware rfkill blocked.", 409,
+                {"stage": stage, "interface": interface, "rfkill_state": state},
+            )
+        if state.get("soft_blocked"):
+            self.run(
+                ["rfkill", "unblock", "wifi"], error_code="RFKILL_BLOCKED",
+                error_message=f"Failed to unblock {interface}.", stage=stage,
+            )
+            state = self.rfkill_state(interface)
+            if state.get("soft_blocked") or state.get("hard_blocked"):
+                raise PinePiError(
+                    "RFKILL_BLOCKED", f"{interface} is rfkill blocked.", 409,
+                    {"stage": stage, "interface": interface, "rfkill_state": state},
+                )
+        return state
+
+    def validate_ap_channel(self, interface: str, channel: int) -> dict:
+        interface = self._interface(interface)
+        capabilities = self.wireless_capabilities(interface)
+        if not capabilities.get("known"):
+            raise PinePiError(
+                "ADAPTER_UNAVAILABLE", f"{interface} wireless capabilities are not available.", 409,
+                {"stage": "capability_check", "interface": interface, "capabilities": capabilities},
+            )
+        if not capabilities.get("ap"):
+            message = "This adapter supports monitor mode but not AP mode." if capabilities.get("monitor") else f"{interface} does not support AP mode."
+            raise PinePiError(
+                "ADAPTER_UNSUPPORTED", message, 409,
+                {"stage": "capability_check", "interface": interface, "capabilities": capabilities},
+            )
+        if channel not in capabilities.get("ap_channels", []):
+            domain = capabilities.get("regulatory_domain") or "current"
+            raise PinePiError(
+                "UNSUPPORTED_CHANNEL",
+                f"Channel {channel} is not supported by {interface} in the {domain} regulatory domain.",
+                409,
+                {
+                    "stage": "channel_validation", "interface": interface, "channel": channel,
+                    "supported_channels": capabilities.get("ap_channels", []), "regulatory_domain": domain,
+                },
+            )
+        return capabilities
 
     def default_routes(self) -> set[str]:
         result = self.run(["ip", "route", "show", "default"], check=False)
@@ -157,25 +381,65 @@ class PrivilegedService:
 
     def set_monitor(self, interface: str, channel: int | None = None) -> None:
         interface = self._interface(interface)
-        self.run(["ip", "link", "set", "dev", interface, "down"])
+        self._unblock_wireless(interface, "monitor_prepare")
+        self.run(
+            ["ip", "link", "set", "dev", interface, "down"],
+            error_code="MONITOR_MODE_FAILED", error_message=f"Failed to bring {interface} down for monitor mode.",
+            stage="monitor_link_down",
+        )
         try:
-            self.run(["iw", "dev", interface, "set", "type", "monitor"])
-            self.run(["ip", "link", "set", "dev", interface, "up"])
+            self.run(
+                ["iw", "dev", interface, "set", "type", "monitor"],
+                error_code="MONITOR_MODE_FAILED", error_message=f"Failed to change {interface} to monitor mode.",
+                stage="monitor_mode_transition",
+            )
+            self.run(
+                ["ip", "link", "set", "dev", interface, "up"],
+                error_code="MONITOR_MODE_FAILED", error_message=f"Failed to bring {interface} up in monitor mode.",
+                stage="monitor_link_up",
+            )
             if channel:
-                self.run(["iw", "dev", interface, "set", "channel", str(channel)])
+                self.run(
+                    ["iw", "dev", interface, "set", "channel", str(channel)],
+                    error_code="MONITOR_MODE_FAILED", error_message=f"Failed to set channel {channel} on {interface}.",
+                    stage="monitor_channel",
+                )
             if self.wireless_info(interface).get("type") != "monitor":
-                raise PinePiError("MONITOR_MODE_FAILED", f"{interface} did not enter monitor mode.", 500)
+                raise PinePiError(
+                    "MONITOR_MODE_FAILED", f"{interface} did not enter monitor mode.", 500,
+                    {"stage": "monitor_verify", "interface": interface, "expected_mode": "monitor", "actual_mode": self.wireless_info(interface).get("type")},
+                )
         except Exception:
             self.restore_interface(interface)
             raise
 
     def restore_interface(self, interface: str) -> None:
         interface = self._interface(interface)
-        self.run(["ip", "link", "set", "dev", interface, "down"], check=False)
-        self.run(["iw", "dev", interface, "set", "type", "managed"], check=False)
-        self.run(["ip", "address", "flush", "dev", interface], check=False)
-        self.run(["ip", "link", "set", "dev", interface, "up"], check=False)
-        self.run(["nmcli", "device", "set", interface, "managed", "yes"], check=False)
+        commands = [
+            ["ip", "link", "set", "dev", interface, "down"],
+            ["iw", "dev", interface, "set", "type", "managed"],
+            ["ip", "address", "flush", "dev", interface],
+            ["ip", "link", "set", "dev", interface, "up"],
+            ["nmcli", "device", "set", interface, "managed", "yes"],
+        ]
+        failures = []
+        for argv in commands:
+            result = self.run(argv, check=False)
+            if result.returncode != 0:
+                failures.append({
+                    "command": argv[0], "arguments": argv[1:], "exit_code": result.returncode,
+                    "stderr": self._bounded_text(result.stderr),
+                })
+        if failures and all(
+            any(marker in item["stderr"].lower() for marker in ("cannot find device", "no such device", "does not exist", "not found"))
+            for item in failures
+        ):
+            return
+        if failures:
+            raise PinePiError(
+                "INTERFACE_RESTORE_FAILED", f"{interface} could not be fully restored to managed idle mode.", 500,
+                {"stage": "interface_restore", "interface": interface, "failures": failures},
+            )
 
     def start_recon(self, interface: str, prefix: Path, operation_id: str) -> OwnedProcess:
         interface = self._interface(interface)
@@ -209,17 +473,191 @@ class PrivilegedService:
             or {"\r", "\n"} & set(password)
         ):
             raise PinePiError("INVALID_PASSPHRASE", "WPA2 passphrase must be 8–63 bytes.")
-        control_dir = session_dir / "hostapd-control"
-        control_dir.mkdir(mode=0o700, exist_ok=True)
-        hostapd_lines = [
-            f"interface={interface}", "driver=nl80211", f"ctrl_interface={control_dir}", f"ssid={ssid}", f"channel={channel}",
-            "hw_mode=g" if channel <= 14 else "hw_mode=a", "country_code=AT", "ieee80211d=1",
-        ]
-        if security == "wpa2":
-            hostapd_lines.extend(["wpa=2", f"wpa_passphrase={password}", "wpa_key_mgmt=WPA-PSK", "rsn_pairwise=CCMP"])
+        return self._start_ap_lifecycle(interface, ssid, channel, security, password, session_dir, operation_id)
+
+    def _start_ap_lifecycle(
+        self, interface: str, ssid: str, channel: int, security: str, password: str | None,
+        session_dir: Path, operation_id: str,
+    ) -> tuple[OwnedProcess, OwnedProcess]:
+        mode_before = self.wireless_info(interface).get("type")
+        diagnostics: dict = {
+            "interface": interface, "channel": channel, "mode_before": mode_before,
+            "expected_interface": interface, "expected_mode": "AP", "expected_ssid": ssid,
+            "cleanup_result": "pending",
+        }
+        hostapd: OwnedProcess | None = None
+        dnsmasq: OwnedProcess | None = None
         hostapd_conf = session_dir / "hostapd.conf"
-        hostapd_conf.write_text("\n".join(hostapd_lines) + "\n", encoding="utf-8")
-        hostapd_conf.chmod(0o600)
+        try:
+            diagnostics["stage"] = "capability_check"
+            capabilities = self.validate_ap_channel(interface, channel)
+            diagnostics["capabilities"] = capabilities
+            diagnostics["regulatory_domain"] = capabilities.get("regulatory_domain")
+
+            diagnostics["stage"] = "rfkill_check"
+            diagnostics["rfkill_state"] = self._unblock_wireless(interface, "rfkill_check")
+
+            diagnostics["stage"] = "networkmanager_release"
+            diagnostics["nm_state_before"] = self.networkmanager_details(interface)
+            self.run(["nmcli", "device", "disconnect", interface], check=False)
+            nm_release = self.run(["nmcli", "device", "set", interface, "managed", "no"], check=False)
+            diagnostics["nm_release_exit"] = nm_release.returncode
+            diagnostics["nm_release_stderr"] = self._bounded_text(nm_release.stderr)
+            nm_after = self.networkmanager_details(interface)
+            if nm_release.returncode == 0:
+                deadline = time.monotonic() + 2
+                while (
+                    nm_after.get("managed") is not False
+                    and nm_after.get("state") not in {"unmanaged", "unavailable"}
+                    and time.monotonic() < deadline
+                ):
+                    time.sleep(0.1)
+                    nm_after = self.networkmanager_details(interface)
+            diagnostics["nm_state_after"] = nm_after
+            if (
+                (nm_release.returncode != 0 and diagnostics["nm_state_before"].get("state") not in {"unmanaged", "unavailable"})
+                or (nm_after.get("managed") is not False and nm_after.get("state") not in {"unmanaged", "unavailable"})
+            ):
+                raise PinePiError(
+                    "NETWORKMANAGER_RELEASE_FAILED", f"NetworkManager did not release {interface} for AP mode.", 500,
+                    {"stage": "networkmanager_release", "interface": interface, "nm_state_after": nm_after},
+                )
+
+            diagnostics["stage"] = "mode_transition"
+            self.run(
+                ["ip", "link", "set", "dev", interface, "down"],
+                error_code="AP_MODE_FAILED", error_message=f"Failed to bring {interface} down for AP mode.", stage="ap_link_down",
+            )
+            self.run(
+                ["iw", "dev", interface, "set", "type", "managed"],
+                error_code="AP_MODE_FAILED", error_message=f"Failed to prepare {interface} for AP mode.", stage="ap_mode_prepare",
+            )
+            self.run(
+                ["ip", "address", "flush", "dev", interface],
+                error_code="AP_ADDRESS_FAILED", error_message=f"Failed to clear temporary addresses from {interface}.",
+                stage="ap_address_cleanup",
+            )
+            self.run(
+                ["ip", "link", "set", "dev", interface, "up"],
+                error_code="AP_MODE_FAILED", error_message=f"Failed to bring {interface} up for AP mode.", stage="ap_link_up",
+            )
+            if not self.wireless_info(interface):
+                raise PinePiError(
+                    "ADAPTER_DISAPPEARED", f"{interface} disappeared during AP startup.", 409,
+                    {"stage": "ap_link_up", "interface": interface},
+                )
+
+            diagnostics["stage"] = "configuration"
+            control_dir = session_dir / "hostapd-control"
+            control_dir.mkdir(mode=0o700, exist_ok=True)
+            domain = capabilities.get("regulatory_domain")
+            hostapd_lines = [
+                f"interface={interface}", "driver=nl80211", f"ctrl_interface={control_dir}", f"ssid={ssid}",
+                f"channel={channel}", "hw_mode=g" if channel <= 14 else "hw_mode=a",
+                f"country_code={domain if domain not in {None, 'unknown', '00'} else 'AT'}", "ieee80211d=1",
+            ]
+            if security == "wpa2":
+                hostapd_lines.extend(["wpa=2", f"wpa_passphrase={password}", "wpa_key_mgmt=WPA-PSK", "rsn_pairwise=CCMP"])
+            hostapd_conf.write_text("\n".join(hostapd_lines) + "\n", encoding="utf-8")
+            hostapd_conf.chmod(0o600)
+            redacted = ["wpa_passphrase=<redacted>" if line.startswith("wpa_passphrase=") else line for line in hostapd_lines]
+            (session_dir / "hostapd.debug.conf").write_text("\n".join(redacted) + "\n", encoding="utf-8")
+
+            dnsmasq_conf = self._write_dnsmasq_config(interface, session_dir)
+
+            diagnostics["stage"] = "hostapd_start"
+            hostapd = self.spawn(["hostapd", str(hostapd_conf)], operation_id + "-hostapd", capture_output=True)
+            deadline = time.monotonic() + 8
+            status_text = ""
+            actual_interface = actual_mode = actual_ssid = None
+            hostapd_status: dict[str, str] = {}
+            while time.monotonic() < deadline:
+                if not hostapd.alive():
+                    break
+                status_result = self.run(["hostapd_cli", "-p", str(control_dir), "-i", interface, "status"], check=False)
+                status_text = status_result.stdout
+                hostapd_status = self._key_value_output(status_text)
+                current = self.wireless_info(interface)
+                actual_mode = current.get("type")
+                actual_ssid = current.get("ssid") or hostapd_status.get("ssid[0]") or hostapd_status.get("ssid")
+                actual_interface = hostapd_status.get("bss[0]") or (interface if hostapd_status else None)
+                if actual_interface == interface and actual_mode and actual_mode.lower() == "ap" and hostapd_status.get("state") == "ENABLED" and actual_ssid == ssid:
+                    break
+                time.sleep(0.2)
+            diagnostics.update({
+                "stage": "hostapd_verify", "actual_interface": actual_interface,
+                "mode_after": actual_mode, "actual_mode": actual_mode,
+                "actual_ssid": actual_ssid, "hostapd_exit": hostapd.returncode,
+                "hostapd_status": self._bounded_text(status_text), "hostapd_output": self._bounded_text(hostapd.output()),
+            })
+            if not (
+                hostapd.alive() and actual_interface == interface and actual_mode and actual_mode.lower() == "ap"
+                and hostapd_status.get("state") == "ENABLED" and actual_ssid == ssid
+            ):
+                raise self._hostapd_failure(interface, ssid, diagnostics)
+
+            diagnostics["stage"] = "address_configuration"
+            self.run(
+                ["ip", "address", "add", "10.77.0.1/24", "dev", interface],
+                error_code="AP_ADDRESS_FAILED", error_message=f"Failed to assign the AP address to {interface}.",
+                stage="address_configuration",
+            )
+            self.run(
+                ["ip", "link", "set", "dev", interface, "up"],
+                error_code="AP_MODE_FAILED", error_message=f"Failed to bring {interface} up after assigning its AP address.",
+                stage="address_configuration",
+            )
+
+            diagnostics["stage"] = "dnsmasq_start"
+            dnsmasq = self.spawn(
+                ["dnsmasq", "--keep-in-foreground", "--conf-file=" + str(dnsmasq_conf)],
+                operation_id + "-dnsmasq", capture_output=True,
+            )
+            time.sleep(0.5)
+            if not dnsmasq.alive():
+                diagnostics.update({
+                    "dnsmasq_exit": dnsmasq.returncode, "dnsmasq_status": "exited",
+                    "dnsmasq_output": self._bounded_text(dnsmasq.output()),
+                })
+                reason = self._last_output_line(dnsmasq.output())
+                message = f"dnsmasq failed to start on {interface}" + (f": {reason}" if reason else "")
+                raise PinePiError("DNSMASQ_START_FAILED", message + ".", 500, diagnostics)
+            diagnostics["dnsmasq_status"] = "running"
+            hostapd_conf.unlink(missing_ok=True)
+            return hostapd, dnsmasq
+        except Exception as exc:
+            self.stop_process(dnsmasq)
+            self.stop_process(hostapd)
+            if hostapd is not None:
+                diagnostics["hostapd_exit"] = hostapd.returncode
+                diagnostics["hostapd_output"] = self._bounded_text(hostapd.output())
+            if dnsmasq is not None:
+                diagnostics["dnsmasq_exit"] = dnsmasq.returncode
+                diagnostics["dnsmasq_output"] = self._bounded_text(dnsmasq.output())
+            hostapd_conf.unlink(missing_ok=True)
+            diagnostics["cleanup_result"] = "processes_stopped; interface_restore_pending"
+            if isinstance(exc, PinePiError):
+                details = self._redact_value({**diagnostics, **exc.details}, password)
+                message = exc.message.replace(password, "<redacted>") if password else exc.message
+                raise PinePiError(exc.code, message, exc.status, details) from exc
+            raise PinePiError(
+                "AP_START_FAILED", f"Unexpected AP startup failure on {interface}.", 500,
+                self._redact_value({**diagnostics, "error": type(exc).__name__}, password),
+            ) from exc
+
+    @classmethod
+    def _redact_value(cls, value, secret: str | None):
+        if not secret:
+            return value
+        if isinstance(value, dict):
+            return {key: cls._redact_value(item, secret) for key, item in value.items()}
+        if isinstance(value, list):
+            return [cls._redact_value(item, secret) for item in value]
+        if isinstance(value, str):
+            return value.replace(secret, "<redacted>")
+        return value
+
+    def _write_dnsmasq_config(self, interface: str, session_dir: Path) -> Path:
         lease_dir = session_dir / "dnsmasq-state"
         lease_dir.mkdir(mode=0o770, exist_ok=True)
         lease_dir.chmod(0o770)
@@ -234,43 +672,65 @@ class PrivilegedService:
             os.chown(leases, dnsmasq_uid, os.getgid())
         except (ImportError, KeyError, PermissionError):
             pass
-        dnsmasq_conf = session_dir / "dnsmasq.conf"
-        dnsmasq_conf.write_text(
+        path = session_dir / "dnsmasq.conf"
+        path.write_text(
             "\n".join([
                 f"interface={interface}", "bind-interfaces", "dhcp-range=10.77.0.10,10.77.0.200,255.255.255.0,12h",
                 "dhcp-option=3,10.77.0.1", "dhcp-option=6,10.77.0.1", f"dhcp-leasefile={leases}",
                 f"pid-file={lease_dir / 'dnsmasq.pid'}", "log-dhcp",
-            ]) + "\n", encoding="utf-8"
+            ]) + "\n", encoding="utf-8",
         )
-        self.run(["nmcli", "device", "set", interface, "managed", "no"], check=False)
-        self.run(["ip", "link", "set", "dev", interface, "down"])
-        self.run(["ip", "address", "flush", "dev", interface])
-        self.run(["ip", "address", "add", "10.77.0.1/24", "dev", interface])
-        self.run(["ip", "link", "set", "dev", interface, "up"])
-        hostapd = self.spawn(["hostapd", str(hostapd_conf)], operation_id + "-hostapd")
-        time.sleep(1)
-        if not hostapd.alive():
-            self.stop_process(hostapd)
-            raise PinePiError("HOSTAPD_START_FAILED", "hostapd exited before the AP became ready.", 500)
-        status = self.run(["hostapd_cli", "-p", str(control_dir), "-i", interface, "status"], check=False).stdout
-        actual_mode = self.wireless_info(interface).get("type")
-        if actual_mode != "AP" or "state=ENABLED" not in status or f"ssid[0]={ssid}" not in status:
-            self.stop_process(hostapd)
-            raise PinePiError("HOSTAPD_START_FAILED", "The interface did not reach the expected AP state and SSID.", 500)
-        dnsmasq = None
-        try:
-            dnsmasq = self.spawn(["dnsmasq", "--keep-in-foreground", "--conf-file=" + str(dnsmasq_conf)], operation_id + "-dnsmasq")
-            time.sleep(0.3)
-            if not dnsmasq.alive():
-                raise PinePiError("DNSMASQ_START_FAILED", "dnsmasq exited during startup.", 500)
-        except Exception:
-            self.stop_process(dnsmasq)
-            self.stop_process(hostapd)
-            hostapd_conf.unlink(missing_ok=True)
-            raise
-        # hostapd has parsed the configuration. Remove the only plaintext credential copy.
-        hostapd_conf.unlink(missing_ok=True)
-        return hostapd, dnsmasq
+        return path
+
+    @staticmethod
+    def _key_value_output(value: str) -> dict[str, str]:
+        result: dict[str, str] = {}
+        for line in value.splitlines():
+            if "=" in line:
+                key, item = line.split("=", 1)
+                result[key.strip()] = item.strip()
+        return result
+
+    @staticmethod
+    def _last_output_line(value: str) -> str:
+        lines = [line.strip() for line in value.splitlines() if line.strip()]
+        return lines[-1][:240] if lines else ""
+
+    def _hostapd_failure(self, interface: str, ssid: str, diagnostics: dict) -> PinePiError:
+        output = str(diagnostics.get("hostapd_output") or "")
+        lower = output.lower()
+        actual_interface = diagnostics.get("actual_interface")
+        actual_mode = diagnostics.get("actual_mode")
+        actual_ssid = diagnostics.get("actual_ssid")
+        if "rfkill" in lower:
+            return PinePiError("RFKILL_BLOCKED", f"{interface} is rfkill blocked.", 409, diagnostics)
+        if "no such device" in lower or "does not exist" in lower:
+            return PinePiError("ADAPTER_DISAPPEARED", f"{interface} disappeared during AP startup.", 409, diagnostics)
+        if "channel" in lower and any(marker in lower for marker in ("not supported", "not allowed", "disabled", "could not select")):
+            return PinePiError("UNSUPPORTED_CHANNEL", f"hostapd failed to start on {interface}: unsupported channel.", 409, diagnostics)
+        if diagnostics.get("hostapd_exit") is not None:
+            reason = self._last_output_line(output)
+            message = f"hostapd failed to start on {interface}" + (f": {reason}" if reason else "")
+            return PinePiError("HOSTAPD_START_FAILED", message + ".", 500, diagnostics)
+        if actual_interface and actual_interface != interface:
+            return PinePiError(
+                "AP_VERIFICATION_FAILED",
+                f"hostapd reported {actual_interface} instead of the requested interface {interface}.",
+                500, diagnostics,
+            )
+        if not actual_mode or str(actual_mode).lower() != "ap":
+            return PinePiError(
+                "AP_VERIFICATION_FAILED", f"{interface} remained in {actual_mode or 'unknown'} mode instead of AP mode.",
+                500, diagnostics,
+            )
+        if actual_ssid != ssid:
+            return PinePiError(
+                "AP_VERIFICATION_FAILED", f"hostapd started on {interface}, but the expected SSID was not active.",
+                500, diagnostics,
+            )
+        reason = self._last_output_line(output)
+        message = f"hostapd failed to become ready on {interface}" + (f": {reason}" if reason else "")
+        return PinePiError("HOSTAPD_START_FAILED", message + ".", 500, diagnostics)
 
     def setup_routing(self, ap_interface: str, uplink: str, operation_id: str) -> dict:
         ap_interface = self._interface(ap_interface)
@@ -286,10 +746,19 @@ class PrivilegedService:
             state = {"table": table, "previous_forwarding": previous, "operation_id": operation_id}
             (self.runtime_dir / f"routing-{operation_id}.json").write_text(json.dumps(state), encoding="utf-8")
         # Roll back every partial nft/sysctl failure, including an injected runner failure.
-        except Exception:  # noqa: BLE001
-            self.run(["nft", "delete", "table", "inet", table], check=False)
-            self.run(["sysctl", "-w", f"net.ipv4.ip_forward={previous}"], check=False)
-            raise PinePiError("ROUTING_SETUP_FAILED", "Temporary AP routing could not be configured.", 500)
+        except Exception as exc:  # noqa: BLE001
+            nft_cleanup = self.run(["nft", "delete", "table", "inet", table], check=False)
+            forwarding_cleanup = self.run(["sysctl", "-w", f"net.ipv4.ip_forward={previous}"], check=False)
+            details = {
+                "stage": "routing_setup", "ap_interface": ap_interface, "uplink": uplink,
+                "cleanup_result": "complete" if nft_cleanup.returncode == 0 and forwarding_cleanup.returncode == 0 else "incomplete",
+            }
+            if isinstance(exc, PinePiError):
+                details.update(exc.details)
+            raise PinePiError(
+                "ROUTING_SETUP_FAILED", f"Temporary AP routing could not be configured: {getattr(exc, 'message', str(exc))}",
+                500, details,
+            ) from exc
         return state
 
     def teardown_routing(self, state: dict | None) -> None:

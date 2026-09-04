@@ -55,7 +55,15 @@ class FakePrivileged:
         if process: process.running = False
     def start_ap(self, interface, ssid, channel, security, password, session_dir, operation_id):
         self.calls.append(("start_ap", interface, security, password))
-        if self.fail_ap: raise PinePiError("HOSTAPD_START_FAILED", "failed", 500)
+        if self.fail_ap:
+            raise PinePiError(
+                "AP_VERIFICATION_FAILED", f"{interface} remained in managed mode instead of AP mode.", 500,
+                {
+                    "stage": "hostapd_verify", "expected_mode": "AP", "actual_mode": "managed",
+                    "expected_ssid": "PinePi-Test", "actual_ssid": None, "hostapd_exit": None,
+                    "hostapd_status": "state=STARTING", "hostapd_output": "nl80211: setup pending",
+                },
+            )
         return FakeProcess(operation_id + "-hostapd"), FakeProcess(operation_id + "-dnsmasq")
     def setup_routing(self, ap_interface, uplink, operation_id):
         self.calls.append(("setup_routing", ap_interface, uplink))
@@ -80,6 +88,13 @@ class FakeAdapters:
         if interface not in self.names:
             raise PinePiError("ADAPTER_NOT_FOUND", "not found", 404)
         return {"name": interface, f"{capability}_capable": True}
+
+    def require_ap_channel(self, interface, channel):
+        if interface not in self.names:
+            raise PinePiError("ADAPTER_NOT_FOUND", "not found", 404)
+        if channel not in {1, 6, 11, 36, 40, 44, 48}:
+            raise PinePiError("UNSUPPORTED_CHANNEL", "unsupported channel", 409)
+        return {"name": interface, "channel": channel}
 
     def choose_uplink(self, requested, ap_interface):
         if requested in {"none", ""}: return None

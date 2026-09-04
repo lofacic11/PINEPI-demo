@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import threading
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -87,6 +88,7 @@ class AdapterService:
         self.privileged = privileged
         self.sys_net = sys_net
         self._capability_cache: dict[str, tuple[float, dict]] = {}
+        self._first_seen: dict[str, float] = {}
 
     @staticmethod
     def validate_name(interface: str) -> str:
@@ -98,42 +100,82 @@ class AdapterService:
         stats = psutil.net_if_stats()
         addresses = psutil.net_if_addrs()
         default_routes = self.privileged.default_routes()
+        now = time.monotonic()
+        present = set(stats) | set(addresses)
+        self._first_seen = {name: seen for name, seen in self._first_seen.items() if name in present}
+        self._capability_cache = {name: value for name, value in self._capability_cache.items() if name in present}
         interfaces: list[dict] = []
-        for name in sorted(set(stats) | set(addresses)):
+        for name in sorted(present):
             if not INTERFACE_PATTERN.fullmatch(name) or name == "lo":
                 continue
+            self._first_seen.setdefault(name, now)
             stat = stats.get(name)
             wireless = (self.sys_net / name / "wireless").exists() or name.startswith(("wl", "wlan"))
             info = self.privileged.wireless_info(name) if wireless else {}
-            capabilities = self._capabilities(name) if wireless else {"monitor": False, "ap": False}
+            capabilities = self._capabilities(name) if wireless else {
+                "known": True, "managed": False, "monitor": False, "ap": False, "ap_channels": [],
+            }
             ipv4 = [a.address for a in addresses.get(name, []) if getattr(a.family, "name", "") == "AF_INET"]
             is_up = bool(stat and stat.isup)
             role = self.registry.role(name)
+            reserved = name == MANAGEMENT_INTERFACE
+            capable = bool(capabilities.get("monitor") or capabilities.get("ap"))
+            if reserved:
+                pinepi_state = "reserved_management"
+                usable = False
+                reason = "Reserved for the PinePi management access point."
+            elif role:
+                pinepi_state = f"active_{role}"
+                usable = False
+                reason = f"Assigned to {role.replace('_', ' ')}."
+            elif wireless and capabilities.get("known") and capable:
+                pinepi_state = "ready"
+                usable = True
+                reason = None
+            elif wireless and not capabilities.get("known") and now - self._first_seen[name] < 15:
+                pinepi_state = "initializing"
+                usable = False
+                reason = capabilities.get("reason") or "Waiting for wireless capabilities to become available."
+            elif wireless:
+                pinepi_state = "unavailable"
+                usable = False
+                reason = capabilities.get("reason") or "This adapter does not advertise monitor or AP mode."
+            else:
+                pinepi_state = "online" if is_up and ipv4 else "idle"
+                usable = bool(is_up)
+                reason = None if is_up else "No active network link."
+            nm_state = self.privileged.networkmanager_state(name)
             interfaces.append(
                 {
                     "name": name,
                     "exists": True,
                     "wireless": wireless,
-                    "state": "up" if is_up else "down",
+                    "kind": "management" if reserved else ("audit" if wireless else "network"),
+                    "state": "up" if is_up else "down",  # Backward-compatible raw link state.
+                    "link_state": "up" if is_up else "down",
+                    "nm_state": nm_state,
                     "mode": info.get("type") or ("ethernet" if not wireless else "unknown"),
                     "role": role or "available",
-                    "reserved": name == MANAGEMENT_INTERFACE,
+                    "pinepi_state": pinepi_state,
+                    "current_operation": role,
+                    "reserved": reserved,
                     "busy": role is not None,
-                    "usable": is_up and name != MANAGEMENT_INTERFACE and role is None,
+                    "usable": usable,
+                    "reason": reason,
+                    "capabilities": capabilities,
                     "ap_capable": bool(capabilities.get("ap")),
                     "monitor_capable": bool(capabilities.get("monitor")),
                     "connected": is_up and bool(ipv4),
                     "connectivity": name in default_routes,
                     "ipv4": ipv4,
-                    "description": "Management AP" if name == MANAGEMENT_INTERFACE else ("Wi-Fi" if wireless else "Network uplink"),
+                    "description": "Management AP" if reserved else ("Audit adapter" if wireless else "Network uplink"),
                 }
             )
         return interfaces
 
     def _capabilities(self, interface: str) -> dict:
-        import time
         cached = self._capability_cache.get(interface)
-        if cached and time.monotonic() - cached[0] < 60:
+        if cached and time.monotonic() - cached[0] < (10 if cached[1].get("known") else 2):
             return cached[1]
         value = self.privileged.wireless_capabilities(interface)
         self._capability_cache[interface] = (time.monotonic(), value)
@@ -151,7 +193,27 @@ class AdapterService:
         if interface == MANAGEMENT_INTERFACE:
             raise PinePiError("MANAGEMENT_INTERFACE_RESERVED", "wlan0 is reserved for management.", 409)
         if not item["wireless"] or not item.get(f"{capability}_capable"):
+            if capability == "ap" and item.get("monitor_capable"):
+                raise PinePiError(
+                    "ADAPTER_UNSUPPORTED",
+                    "This adapter supports monitor mode but not AP mode.",
+                    409,
+                    {"interface": interface, "capability": capability},
+                )
             raise PinePiError("ADAPTER_UNSUPPORTED", f"{interface} does not advertise {capability} capability.", 409)
+        return item
+
+    def require_ap_channel(self, interface: str, channel: int) -> dict:
+        item = self.get(interface)
+        channels = item.get("capabilities", {}).get("ap_channels") or []
+        if channel not in channels:
+            domain = item.get("capabilities", {}).get("regulatory_domain") or "current"
+            raise PinePiError(
+                "UNSUPPORTED_CHANNEL",
+                f"Channel {channel} is not supported by {interface} in the {domain} regulatory domain.",
+                409,
+                {"interface": interface, "channel": channel, "supported_channels": channels, "regulatory_domain": domain},
+            )
         return item
 
     def uplinks(self, ap_interface: str | None = None) -> list[dict]:

@@ -82,7 +82,6 @@
           <table><thead><tr><th data-sort="ssid">SSID</th><th data-sort="bssid">BSSID</th><th data-sort="channel">CH</th><th data-sort="signal">Signal</th><th data-sort="security">Security</th><th data-sort="client_count">Clients</th><th>Seen</th></tr></thead><tbody id="reconTable"></tbody></table>
         </div>
         <div class="mobile-cards" id="reconCards"></div>
-        <div class="card block-gap" id="networkDetail"><h3>Network Details</h3><div class="empty">Select a network to view its observed clients.</div></div>
       </section>
 
       <section class="page" id="ap">
@@ -90,6 +89,7 @@
         <div class="grid grid-2">
           <div class="card"><h3>Access Point</h3>
             <div class="field"><label for="apInterface">AP Interface</label><select id="apInterface"></select></div>
+            <div class="subtitle capability-hint" id="apCapabilityHint"></div>
             <div class="field field-gap"><label for="apSsid">SSID</label><input id="apSsid" value="PinePi-Test" maxlength="32"></div>
             <div class="grid grid-2 field-gap">
               <div class="field"><label for="apChannel">Channel</label><select id="apChannel"><option>1</option><option selected>6</option><option>11</option><option>36</option><option>40</option><option>44</option><option>48</option></select></div>

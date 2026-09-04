@@ -55,6 +55,8 @@ class HelperState:
             return service.wireless_info(str(params.get("interface", "")))
         if action == "wireless_capabilities":
             return service.wireless_capabilities(str(params.get("interface", "")))
+        if action == "networkmanager_state":
+            return service.networkmanager_state(str(params.get("interface", "")))
         if action == "default_routes":
             return sorted(service.default_routes())
         if action == "set_monitor":

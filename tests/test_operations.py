@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import zipfile
 from pathlib import Path
 
@@ -84,6 +85,25 @@ def test_failed_ap_start_cleans_processes_interface_and_reservation(service):
     assert ("teardown_routing", None) in privileged.calls
     assert ("restore", "wlan1") in privileged.calls
     assert any(call[0] == "stop" for call in privileged.calls)
+
+
+def test_ap_failure_log_and_txt_export_include_structured_diagnostics(service):
+    operations, privileged, registry, database = service
+    privileged.fail_ap = True
+    with pytest.raises(PinePiError) as error:
+        operations.start_ap({"interface": "wlan1", "ssid": "PinePi-Test", "channel": 6, "security": "open", "forwarding": False})
+    assert error.value.message == "wlan1 remained in managed mode instead of AP mode."
+    assert registry.snapshot() == {}
+    row = database.fetchone("SELECT context_json FROM events WHERE component='access_point' AND event='start_failed'")
+    context = json.loads(row["context_json"])
+    assert context["stage"] == "hostapd_verify"
+    assert context["actual_mode"] == "managed"
+    assert context["cleanup_result"] == "complete"
+    exporter = ExportService(database, operations.events, operations)
+    payload, _name, _mimetype = exporter.logs("txt", "ERROR", "access_point", None)
+    text = payload.decode("utf-8")
+    assert '"stage":"hostapd_verify"' in text
+    assert '"hostapd_status":"state=STARTING"' in text
 
 
 def test_ap_stop_removes_routing_and_restores_interface(service):

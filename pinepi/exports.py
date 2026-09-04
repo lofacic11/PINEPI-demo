@@ -59,7 +59,17 @@ class ExportService:
             writer.writerows({key: row.get(key) for key in writer.fieldnames} for row in rows)
             return stream.getvalue().encode("utf-8"), "pinepi_logs.csv", "text/csv; charset=utf-8"
         if kind == "txt":
-            lines = [f"{row['timestamp']} {row['level']:<7} {row['component']:<16} {row['event']} - {row['message']}" for row in rows]
+            lines = []
+            for row in rows:
+                context = row.get("context_json") or "{}"
+                try:
+                    context = json.dumps(json.loads(context), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                except (json.JSONDecodeError, TypeError):
+                    context = "{}"
+                lines.append(
+                    f"{row['timestamp']} {row['level']:<7} {row['component']:<16} {row['event']} - "
+                    f"{row['message']} | context={context}"
+                )
             return ("\n".join(lines) + ("\n" if lines else "")).encode("utf-8"), "pinepi_logs.txt", "text/plain; charset=utf-8"
         raise PinePiError("INVALID_EXPORT_FORMAT", "Log export must be TXT, CSV or JSON.")
 

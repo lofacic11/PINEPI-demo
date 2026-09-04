@@ -63,6 +63,9 @@ class RemotePrivilegedService:
     def wireless_capabilities(self, interface: str) -> dict:
         return self._rpc("wireless_capabilities", interface=interface)
 
+    def networkmanager_state(self, interface: str) -> str:
+        return str(self._rpc("networkmanager_state", interface=interface))
+
     def default_routes(self) -> set[str]:
         return set(self._rpc("default_routes"))
 

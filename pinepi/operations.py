@@ -156,13 +156,26 @@ class OperationService:
             return True
         except Exception as exc:  # noqa: BLE001
             try:
+                context = self._failure_context(exc, "failed")
+                context.update({"operation_id": operation_id, "action": action})
                 self.events.write(
-                    "ERROR", component, "cleanup_failed", "A lifecycle cleanup step failed.",
-                    operation_id=operation_id, action=action, error=type(exc).__name__,
+                    "ERROR", component, "cleanup_failed", "A lifecycle cleanup step failed.", **context,
                 )
             except Exception:  # noqa: BLE001
                 return False
             return False
+
+    @staticmethod
+    def _failure_context(exc: Exception, cleanup_result: str) -> dict:
+        context = {
+            "error": getattr(exc, "message", str(exc)) or type(exc).__name__,
+            "error_code": getattr(exc, "code", type(exc).__name__),
+            "cleanup_result": cleanup_result,
+        }
+        if isinstance(exc, PinePiError):
+            context.update(exc.details)
+            context["cleanup_result"] = cleanup_result
+        return context
 
     # Recon
     def start_recon(self, interface: str, mode: str = "normal") -> dict:
@@ -189,22 +202,29 @@ class OperationService:
                 process = self.privileged.start_recon(interface, prefix, operation_id)
                 time.sleep(0.2)
                 if not process.alive():
-                    raise PinePiError("RECON_START_FAILED", "Recon process exited during startup.", 500)
+                    raise PinePiError(
+                        "RECON_START_FAILED", "Recon process exited during startup.", 500,
+                        {"stage": "recon_process_start", "interface": interface, "process_exit": True},
+                    )
                 self._recon = ActiveRecon(operation_id, interface, mode, started, prefix, reservation, process)
                 self.db.execute("UPDATE recon_sessions SET status='RUNNING' WHERE id=?", (operation_id,))
                 self.events.write("INFO", "recon", "started", "Recon started.", interface=interface, session_id=operation_id)
                 self._watch("recon", operation_id)
                 return self.recon_status()
-            except Exception:
-                self._cleanup_call("recon", operation_id, "stop_process", lambda: self.privileged.stop_process(process))
-                self._cleanup_call("recon", operation_id, "restore_interface", lambda: self.privileged.restore_interface(interface))
-                self._cleanup_call("recon", operation_id, "forget_restore", lambda: self.privileged.forget_restore(operation_id))
+            except Exception as exc:
+                cleanup_ok = self._cleanup_call("recon", operation_id, "stop_process", lambda: self.privileged.stop_process(process))
+                cleanup_ok &= self._cleanup_call("recon", operation_id, "restore_interface", lambda: self.privileged.restore_interface(interface))
+                cleanup_ok &= self._cleanup_call("recon", operation_id, "forget_restore", lambda: self.privileged.forget_restore(operation_id))
                 self.registry.release(reservation)
                 self.db.execute(
                     "UPDATE recon_sessions SET status='ERROR',ended_at=?,stop_reason='startup_failed' WHERE id=?",
                     (utcnow(), operation_id),
                 )
-                self.events.write("ERROR", "recon", "start_failed", "Recon failed to start.", interface=interface, session_id=operation_id)
+                context = self._failure_context(exc, "complete" if cleanup_ok else "incomplete")
+                context.update({"interface": interface, "session_id": operation_id})
+                self.events.write(
+                    "ERROR", "recon", "start_failed", f"Recon failed to start: {context['error']}", **context,
+                )
                 raise
 
     def stop_recon(self, reason: str = "user") -> dict:
@@ -377,19 +397,26 @@ class OperationService:
                 process = self.privileged.start_capture(interface, path, self.max_capture_bytes, operation_id)
                 time.sleep(0.2)
                 if not process.alive():
-                    raise PinePiError("CAPTURE_START_FAILED", "Capture process exited during startup.", 500)
+                    raise PinePiError(
+                        "CAPTURE_START_FAILED", "Capture process exited during startup.", 500,
+                        {"stage": "capture_process_start", "interface": interface, "process_exit": True},
+                    )
                 self._capture = ActiveCapture(operation_id, capture_name, interface, channel, started, path, reservation, process)
                 self.db.execute("UPDATE captures SET status='RUNNING' WHERE id=?", (operation_id,))
                 self.events.write("INFO", "capture", "started", "Standalone capture started.", interface=interface, capture_id=operation_id)
                 self._watch("capture", operation_id)
                 return self.capture_status()
-            except Exception:
-                self._cleanup_call("capture", operation_id, "stop_process", lambda: self.privileged.stop_process(process))
-                self._cleanup_call("capture", operation_id, "restore_interface", lambda: self.privileged.restore_interface(interface))
-                self._cleanup_call("capture", operation_id, "forget_restore", lambda: self.privileged.forget_restore(operation_id))
+            except Exception as exc:
+                cleanup_ok = self._cleanup_call("capture", operation_id, "stop_process", lambda: self.privileged.stop_process(process))
+                cleanup_ok &= self._cleanup_call("capture", operation_id, "restore_interface", lambda: self.privileged.restore_interface(interface))
+                cleanup_ok &= self._cleanup_call("capture", operation_id, "forget_restore", lambda: self.privileged.forget_restore(operation_id))
                 self.registry.release(reservation)
                 self.db.execute("UPDATE captures SET status='ERROR',ended_at=?,stop_reason='startup_failed' WHERE id=?", (utcnow(), operation_id))
-                self.events.write("ERROR", "capture", "start_failed", "Capture failed to start.", interface=interface, capture_id=operation_id)
+                context = self._failure_context(exc, "complete" if cleanup_ok else "incomplete")
+                context.update({"interface": interface, "capture_id": operation_id})
+                self.events.write(
+                    "ERROR", "capture", "start_failed", f"Capture failed to start: {context['error']}", **context,
+                )
                 raise
 
     def stop_capture(self, reason: str = "user") -> dict:
@@ -502,7 +529,17 @@ class OperationService:
         require(security in {"open", "wpa2"}, "INVALID_SECURITY", "Security must be Open or WPA2-PSK.")
         if security == "wpa2":
             require(8 <= len(password.encode("utf-8")) <= 63 and not {"\n", "\r"} & set(password), "INVALID_PASSPHRASE", "WPA2 passphrase must be 8–63 bytes.")
-        self.adapters.require_wireless(interface, "ap")
+        try:
+            self.adapters.require_wireless(interface, "ap")
+            self.adapters.require_ap_channel(interface, channel)
+        except PinePiError as exc:
+            context = self._failure_context(exc, "not_started")
+            context.update({"interface": interface, "channel": channel})
+            self.events.write(
+                "WARNING", "access_point", "start_rejected", "Access Point start was rejected during preflight.",
+                **context,
+            )
+            raise
         if capture_traffic:
             self.check_storage(self.max_capture_bytes)
         effective_uplink = self.adapters.choose_uplink(requested_uplink, interface) if forwarding else None
@@ -539,7 +576,10 @@ class OperationService:
                     capture = self.privileged.start_capture(interface, capture_path, self.max_capture_bytes, operation_id + "-traffic")
                     time.sleep(0.2)
                     if not capture.alive():
-                        raise PinePiError("CAPTURE_START_FAILED", "AP traffic capture did not start.", 500)
+                        raise PinePiError(
+                            "CAPTURE_START_FAILED", "AP traffic capture did not start.", 500,
+                            {"stage": "ap_capture_start", "interface": interface, "process_exit": True},
+                        )
                 self._ap = ActiveAP(
                     operation_id, interface, ssid, channel, security, requested_uplink, effective_uplink,
                     started, session_dir, reservation, uplink_reservation, hostapd, dnsmasq, routing, capture, capture_path,
@@ -552,18 +592,22 @@ class OperationService:
                 )
                 self._watch("ap", operation_id)
                 return self.ap_status()
-            except Exception:
-                self._cleanup_call("access_point", operation_id, "stop_capture", lambda: self.privileged.stop_process(capture))
-                self._cleanup_call("access_point", operation_id, "teardown_routing", lambda: self.privileged.teardown_routing(routing))
-                self._cleanup_call("access_point", operation_id, "stop_dnsmasq", lambda: self.privileged.stop_process(dnsmasq))
-                self._cleanup_call("access_point", operation_id, "stop_hostapd", lambda: self.privileged.stop_process(hostapd))
-                self._cleanup_call("access_point", operation_id, "restore_interface", lambda: self.privileged.restore_interface(interface))
-                self._cleanup_call("access_point", operation_id, "forget_restore", lambda: self.privileged.forget_restore(operation_id))
+            except Exception as exc:
+                cleanup_ok = self._cleanup_call("access_point", operation_id, "stop_capture", lambda: self.privileged.stop_process(capture))
+                cleanup_ok &= self._cleanup_call("access_point", operation_id, "teardown_routing", lambda: self.privileged.teardown_routing(routing))
+                cleanup_ok &= self._cleanup_call("access_point", operation_id, "stop_dnsmasq", lambda: self.privileged.stop_process(dnsmasq))
+                cleanup_ok &= self._cleanup_call("access_point", operation_id, "stop_hostapd", lambda: self.privileged.stop_process(hostapd))
+                cleanup_ok &= self._cleanup_call("access_point", operation_id, "restore_interface", lambda: self.privileged.restore_interface(interface))
+                cleanup_ok &= self._cleanup_call("access_point", operation_id, "forget_restore", lambda: self.privileged.forget_restore(operation_id))
                 self.registry.release(uplink_reservation)
                 self.registry.release(reservation)
                 (session_dir / "hostapd.conf").unlink(missing_ok=True)
                 self.db.execute("UPDATE ap_sessions SET status='ERROR',ended_at=?,stop_reason='startup_failed' WHERE id=?", (utcnow(), operation_id))
-                self.events.write("ERROR", "access_point", "start_failed", "Test access point failed to start.", interface=interface, session_id=operation_id)
+                context = self._failure_context(exc, "complete" if cleanup_ok else "incomplete")
+                context.update({"interface": interface, "session_id": operation_id})
+                self.events.write(
+                    "ERROR", "access_point", "start_failed", f"Test access point failed to start: {context['error']}", **context,
+                )
                 raise
 
     def stop_ap(self, reason: str = "user") -> dict:
