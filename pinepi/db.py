@@ -7,7 +7,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 class Database:
@@ -64,8 +64,18 @@ class Database:
                 );
                 CREATE TABLE IF NOT EXISTS ap_clients (
                     session_id TEXT NOT NULL REFERENCES ap_sessions(id) ON DELETE CASCADE,
-                    mac TEXT NOT NULL, ip TEXT, first_seen TEXT NOT NULL, last_seen TEXT NOT NULL,
-                    rx_bytes INTEGER, tx_bytes INTEGER,
+                    mac TEXT NOT NULL, ip_address TEXT, hostname TEXT, ip_source TEXT,
+                    first_seen TEXT NOT NULL, last_seen TEXT NOT NULL,
+                    connected_at TEXT, disconnected_at TEXT,
+                    association_state TEXT NOT NULL DEFAULT 'disconnected',
+                    association_count INTEGER NOT NULL DEFAULT 0,
+                    signal_dbm INTEGER, inactive_ms INTEGER,
+                    authenticated INTEGER, authorized INTEGER,
+                    download_bytes INTEGER NOT NULL DEFAULT 0,
+                    upload_bytes INTEGER NOT NULL DEFAULT 0,
+                    ap_rx_bytes INTEGER, ap_tx_bytes INTEGER,
+                    last_connected_seconds INTEGER,
+                    blocked INTEGER NOT NULL DEFAULT 0, blocked_at TEXT,
                     PRIMARY KEY(session_id, mac)
                 );
                 CREATE TABLE IF NOT EXISTS captures (
@@ -125,6 +135,43 @@ class Database:
                 "target_last_seen": "TEXT",
             })
             row = db.execute("SELECT version FROM schema_meta LIMIT 1").fetchone()
+            previous_version = int(row["version"]) if row is not None else 0
+            self._ensure_columns(db, "ap_clients", {
+                "ip_address": "TEXT",
+                "hostname": "TEXT",
+                "ip_source": "TEXT",
+                "connected_at": "TEXT",
+                "disconnected_at": "TEXT",
+                "association_state": "TEXT NOT NULL DEFAULT 'disconnected'",
+                "association_count": "INTEGER NOT NULL DEFAULT 0",
+                "signal_dbm": "INTEGER",
+                "inactive_ms": "INTEGER",
+                "authenticated": "INTEGER",
+                "authorized": "INTEGER",
+                "download_bytes": "INTEGER NOT NULL DEFAULT 0",
+                "upload_bytes": "INTEGER NOT NULL DEFAULT 0",
+                "ap_rx_bytes": "INTEGER",
+                "ap_tx_bytes": "INTEGER",
+                "last_connected_seconds": "INTEGER",
+                "blocked": "INTEGER NOT NULL DEFAULT 0",
+                "blocked_at": "TEXT",
+            })
+            if previous_version < 3:
+                legacy_columns = {
+                    item["name"] for item in db.execute("PRAGMA table_info(ap_clients)")
+                }
+                if {"ip", "rx_bytes", "tx_bytes"} <= legacy_columns:
+                    # Version 1/2 counters came directly from the AP-side iw
+                    # station dump. Preserve them while giving their direction
+                    # explicit client- and AP-oriented names.
+                    db.execute(
+                        "UPDATE ap_clients SET ip_address=COALESCE(ip_address,ip),"
+                        "upload_bytes=CASE WHEN upload_bytes=0 THEN COALESCE(rx_bytes,0) ELSE upload_bytes END,"
+                        "download_bytes=CASE WHEN download_bytes=0 THEN COALESCE(tx_bytes,0) ELSE download_bytes END,"
+                        "ap_rx_bytes=COALESCE(ap_rx_bytes,rx_bytes),"
+                        "ap_tx_bytes=COALESCE(ap_tx_bytes,tx_bytes),"
+                        "association_count=CASE WHEN association_count=0 THEN 1 ELSE association_count END"
+                    )
             if row is None:
                 db.execute("INSERT INTO schema_meta(version) VALUES (?)", (SCHEMA_VERSION,))
             elif row["version"] < SCHEMA_VERSION:

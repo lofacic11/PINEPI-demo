@@ -105,6 +105,26 @@ class RemotePrivilegedService:
     def station_dump(self, interface: str) -> list[dict]:
         return self._rpc("station_dump", interface=interface)
 
+    def ap_client_snapshot(self, interface: str, session_dir: Path, operation_id: str) -> list[dict]:
+        return self._rpc(
+            "ap_client_snapshot",
+            interface=interface,
+            session_dir=str(session_dir),
+            operation_id=operation_id,
+        )
+
+    def ap_client_action(
+        self, interface: str, session_dir: Path, operation_id: str, mac: str, action: str,
+    ) -> dict:
+        return self._rpc(
+            "ap_client_action",
+            interface=interface,
+            session_dir=str(session_dir),
+            operation_id=operation_id,
+            mac=mac,
+            client_action=action,
+        )
+
     def inspect_capture(self, path: Path) -> CommandResult:
         data = self._rpc("inspect_capture", path=str(path))
         return CommandResult(data["returncode"], data.get("stdout", ""), data.get("stderr", ""))

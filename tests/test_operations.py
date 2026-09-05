@@ -296,3 +296,49 @@ def test_privileged_helper_rejects_unknown_actions_paths_and_ids(tmp_path):
     with pytest.raises(PinePiError) as error:
         state.operation_id("../../bad")
     assert error.value.code == "INVALID_OPERATION_ID"
+
+
+def test_privileged_helper_revalidates_active_ap_client_membership(tmp_path):
+    state = HelperState(tmp_path / "data")
+    operation_id = "a" * 32
+    session_dir = state.data_dir / "ap_sessions" / operation_id
+    session_dir.mkdir(parents=True)
+
+    class LiveProcess:
+        @staticmethod
+        def alive():
+            return True
+
+    state.processes[operation_id + "-hostapd"] = LiveProcess()
+    state.access_points[operation_id] = {
+        "interface": "wlan1",
+        "session_dir": str(session_dir),
+        "blocked_macs": set(),
+    }
+    associated = [{"mac": "02:11:22:33:44:55"}]
+    calls = []
+    state.privileged.station_dump = lambda _interface: list(associated)
+    state.privileged.ap_client_action = lambda interface, directory, op_id, mac, action: (
+        calls.append((interface, directory, op_id, mac, action)) or {"result": "OK"}
+    )
+    base = {
+        "interface": "wlan1",
+        "session_dir": str(session_dir),
+        "operation_id": operation_id,
+    }
+
+    with pytest.raises(PinePiError) as wrong_ap:
+        state.dispatch("ap_client_action", {
+            **base, "interface": "wlan2", "mac": "02:11:22:33:44:55", "client_action": "kick",
+        })
+    state.dispatch("ap_client_action", {**base, "mac": "02:11:22:33:44:55", "client_action": "kick"})
+    with pytest.raises(PinePiError) as unknown:
+        state.dispatch("ap_client_action", {**base, "mac": "06:66:77:88:99:AA", "client_action": "kick"})
+    state.dispatch("ap_client_action", {**base, "mac": "02:11:22:33:44:55", "client_action": "block"})
+    associated.clear()
+    state.dispatch("ap_client_action", {**base, "mac": "02:11:22:33:44:55", "client_action": "unblock"})
+
+    assert wrong_ap.value.code == "AP_NOT_ACTIVE"
+    assert unknown.value.code == "CLIENT_NOT_ASSOCIATED"
+    assert [call[-1] for call in calls] == ["kick", "block", "unblock"]
+    assert state.access_points[operation_id]["blocked_macs"] == set()

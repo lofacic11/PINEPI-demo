@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import ipaddress
+import json
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -99,6 +101,7 @@ def test_managed_or_monitor_adapter_transitions_to_verified_ap_then_gets_address
     assert not (session_dir / "hostapd.conf").exists()
     assert "super-secret" not in (session_dir / "hostapd.debug.conf").read_text(encoding="utf-8")
     assert "wpa_passphrase=<redacted>" in (session_dir / "hostapd.debug.conf").read_text(encoding="utf-8")
+    assert "macaddr_acl=0" in (session_dir / "hostapd.debug.conf").read_text(encoding="utf-8")
     service.restore_interface("wlan1")
     assert calls.count(["iw", "dev", "wlan1", "set", "type", "managed"]) == 2
 
@@ -247,6 +250,166 @@ def test_management_and_temporary_dnsmasq_configs_are_disjoint(tmp_path):
     }
     assert temporary_listeners == {"10.77.0.1"}
     assert management_listeners.isdisjoint(temporary_listeners)
+
+
+def test_station_dump_keeps_ap_counter_perspective_and_metadata(tmp_path):
+    output = """
+Station 02:11:22:33:44:55 (on wlan1)
+\tinactive time:\t42 ms
+\trx bytes:\t205599
+\trx packets:\t1001
+\ttx bytes:\t1528305
+\ttx packets:\t2002
+\tsignal:\t-47 [-47] dBm
+\tconnected time:\t73 seconds
+\tauthenticated:\tyes
+\tauthorized:\tyes
+"""
+
+    def runner(_argv, **_kwargs):
+        return SimpleNamespace(returncode=0, stdout=output, stderr="")
+
+    stations = PrivilegedService(tmp_path / "runtime", runner=runner).station_dump("wlan1")
+
+    assert stations == [{
+        "mac": "02:11:22:33:44:55",
+        "ap_rx_bytes": 205599,
+        "ap_tx_bytes": 1528305,
+        "ap_rx_packets": 1001,
+        "ap_tx_packets": 2002,
+        "signal_dbm": -47,
+        "inactive_ms": 42,
+        "connected_seconds": 73,
+        "authenticated": True,
+        "authorized": True,
+    }]
+
+
+def test_ap_client_snapshot_prefers_current_owned_dhcp_lease(tmp_path):
+    operation_id = "a" * 32
+    session_dir = tmp_path / operation_id
+    state_dir = session_dir / "dnsmasq-state"
+    state_dir.mkdir(parents=True)
+    expires = int(time.time()) + 3600
+    (state_dir / "dnsmasq.leases").write_text(
+        f"{expires} 02:11:22:33:44:55 10.77.0.25 laptop 01:02:11:22:33:44:55\n",
+        encoding="utf-8",
+    )
+
+    def runner(argv, **_kwargs):
+        if argv[0] == "iw":
+            stdout = "Station 02:11:22:33:44:55 (on wlan1)\n\trx bytes: 10\n\ttx bytes: 20\n"
+        else:
+            stdout = json.dumps([{
+                "dst": "10.77.0.99", "lladdr": "02:11:22:33:44:55", "state": ["REACHABLE"],
+            }])
+        return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
+
+    clients = PrivilegedService(tmp_path / "runtime", runner=runner).ap_client_snapshot(
+        "wlan1", session_dir, operation_id,
+    )
+
+    assert clients[0]["ip_address"] == "10.77.0.25"
+    assert clients[0]["hostname"] == "laptop"
+    assert clients[0]["ip_source"] == "dhcp_lease"
+    assert clients[0]["lease_expires_at"] == expires
+
+
+@pytest.mark.parametrize("lease_contents", [None, "1 02:11:22:33:44:55 10.77.0.25 old-name *\n"])
+def test_ap_client_snapshot_uses_neighbor_when_lease_is_missing_or_stale(tmp_path, lease_contents):
+    operation_id = "b" * 32
+    session_dir = tmp_path / operation_id
+    (session_dir / "dnsmasq-state").mkdir(parents=True)
+    if lease_contents is not None:
+        (session_dir / "dnsmasq-state" / "dnsmasq.leases").write_text(
+            lease_contents, encoding="utf-8",
+        )
+
+    def runner(argv, **_kwargs):
+        if argv[0] == "iw":
+            stdout = "Station 02:11:22:33:44:55 (on wlan1)\n\trx bytes: 10\n\ttx bytes: 20\n"
+        else:
+            stdout = json.dumps([{
+                "dst": "10.77.0.31", "lladdr": "02:11:22:33:44:55", "state": "STALE",
+            }])
+        return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
+
+    client = PrivilegedService(tmp_path / "runtime", runner=runner).ap_client_snapshot(
+        "wlan1", session_dir, operation_id,
+    )[0]
+
+    assert client["ip_address"] == "10.77.0.31"
+    assert client["hostname"] is None
+    assert client["ip_source"] == "neighbor"
+
+
+def test_ap_client_snapshot_does_not_invent_ip_without_valid_mapping(tmp_path):
+    operation_id = "c" * 32
+    session_dir = tmp_path / operation_id
+    state_dir = session_dir / "dnsmasq-state"
+    state_dir.mkdir(parents=True)
+    (state_dir / "dnsmasq.leases").write_text(
+        "1 02:11:22:33:44:55 10.77.0.25 expired *\n", encoding="utf-8",
+    )
+
+    def runner(argv, **_kwargs):
+        stdout = "Station 02:11:22:33:44:55 (on wlan1)\n" if argv[0] == "iw" else "[]"
+        return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
+
+    client = PrivilegedService(tmp_path / "runtime", runner=runner).ap_client_snapshot(
+        "wlan1", session_dir, operation_id,
+    )[0]
+
+    assert client["ip_address"] is None
+    assert client["hostname"] is None
+    assert client["ip_source"] is None
+
+
+@pytest.mark.parametrize(
+    ("action", "arguments"),
+    [
+        ("kick", ["deauthenticate", "02:11:22:33:44:55"]),
+        ("block", ["deny_acl", "ADD_MAC", "02:11:22:33:44:55"]),
+        ("unblock", ["deny_acl", "DEL_MAC", "02:11:22:33:44:55"]),
+    ],
+)
+def test_ap_client_actions_use_private_hostapd_control_socket(tmp_path, action, arguments):
+    operation_id = "d" * 32
+    session_dir = tmp_path / operation_id
+    session_dir.mkdir()
+    calls = []
+
+    def runner(argv, **_kwargs):
+        calls.append(argv)
+        return SimpleNamespace(returncode=0, stdout="OK\n", stderr="")
+
+    result = PrivilegedService(tmp_path / "runtime", runner=runner).ap_client_action(
+        "wlan1", session_dir, operation_id, "02:11:22:33:44:55", action,
+    )
+
+    assert calls == [[
+        "hostapd_cli", "-p", str(session_dir / "hostapd-control"), "-i", "wlan1", *arguments,
+    ]]
+    assert result["result"] == "OK"
+
+
+def test_hostapd_client_action_failure_is_structured(tmp_path):
+    operation_id = "e" * 32
+    session_dir = tmp_path / operation_id
+    session_dir.mkdir()
+    service = PrivilegedService(
+        tmp_path / "runtime",
+        runner=lambda _argv, **_kwargs: SimpleNamespace(returncode=0, stdout="FAIL\n", stderr=""),
+    )
+
+    with pytest.raises(PinePiError) as error:
+        service.ap_client_action(
+            "wlan1", session_dir, operation_id, "02:11:22:33:44:55", "kick",
+        )
+
+    assert error.value.code == "HOSTAPD_CLIENT_ACTION_FAILED"
+    assert error.value.status == 502
+    assert error.value.details["action"] == "kick"
 
 
 def test_ap_gateway_is_verified_before_dnsmasq_start(tmp_path, monkeypatch):

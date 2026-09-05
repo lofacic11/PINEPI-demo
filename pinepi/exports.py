@@ -86,7 +86,13 @@ class ExportService:
         session = self.db.fetchone("SELECT * FROM ap_sessions WHERE id=?", (session_id,))
         if not session:
             raise PinePiError("SESSION_NOT_FOUND", "Access Point session not found.", 404)
-        clients = self.db.fetchall("SELECT mac,ip,first_seen,last_seen,rx_bytes,tx_bytes FROM ap_clients WHERE session_id=? ORDER BY first_seen", (session_id,))
+        clients = self.db.fetchall(
+            "SELECT mac,ip_address,hostname,ip_source,first_seen,last_seen,connected_at,disconnected_at,"
+            "association_state,association_count,signal_dbm,inactive_ms,authenticated,authorized,"
+            "download_bytes,upload_bytes,ap_rx_bytes,ap_tx_bytes,last_connected_seconds,blocked,blocked_at "
+            "FROM ap_clients WHERE session_id=? ORDER BY first_seen",
+            (session_id,),
+        )
         export_dir = self.operations.data_dir / "exports"
         zip_path = self.operations.authorized_path(
             export_dir / f"ap_session_{safe_name(session_id)}_{uuid.uuid4().hex[:8]}.zip", export_dir
@@ -102,8 +108,15 @@ class ExportService:
             capture = candidate if candidate.is_file() else None
         capture_size = capture.stat().st_size if capture else 0
         metadata["traffic_totals"] = {
-            "rx_bytes": sum(item.get("rx_bytes") or 0 for item in clients),
-            "tx_bytes": sum(item.get("tx_bytes") or 0 for item in clients),
+            "download_bytes": sum(item.get("download_bytes") or 0 for item in clients),
+            "upload_bytes": sum(item.get("upload_bytes") or 0 for item in clients),
+        }
+        metadata["client_counter_semantics"] = {
+            "download_bytes": "Bytes transmitted by the AP to the client (AP TX / client RX).",
+            "upload_bytes": "Bytes received by the AP from the client (AP RX / client TX).",
+            "ap_rx_bytes": "Latest kernel per-association counter for bytes received by the AP.",
+            "ap_tx_bytes": "Latest kernel per-association counter for bytes transmitted by the AP.",
+            "scope": "Accumulated per MAC for this AP session across detected associations.",
         }
         metadata["capture_file"] = "traffic" + capture.suffix if capture else None
         if shutil.disk_usage(export_dir).free < capture_size + self.operations.min_free_bytes:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import re
@@ -17,7 +18,6 @@ from typing import BinaryIO
 from .adapters import INTERFACE_PATTERN, MANAGEMENT_INTERFACE
 from .errors import PinePiError
 
-
 IW_FREQUENCY_PATTERN = re.compile(
     r"^\s*\*\s*(?P<frequency>\d+(?:\.\d+)?)\s*MHz\s*"
     r"\[\s*(?P<channel>\d+)\s*\](?P<details>.*)$",
@@ -30,6 +30,19 @@ AP_GATEWAY_CIDR = f"{AP_GATEWAY_IP}/24"
 AP_DHCP_START = "10.77.0.10"
 AP_DHCP_END = "10.77.0.200"
 AP_NETMASK = "255.255.255.0"
+AP_NETWORK = ipaddress.ip_network(AP_SUBNET)
+CLIENT_MAC_PATTERN = re.compile(r"^(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$")
+
+
+def normalize_client_mac(value: str) -> str:
+    """Validate a unicast station MAC before it reaches a system command."""
+
+    mac = str(value or "").upper()
+    valid = CLIENT_MAC_PATTERN.fullmatch(mac) and mac != "00:00:00:00:00:00"
+    valid = bool(valid and not (int(mac[:2], 16) & 1))
+    if not valid:
+        raise PinePiError("INVALID_CLIENT_MAC", "Client MAC must be a valid unicast MAC address.")
+    return mac
 
 
 def parse_iw_ap_channels(output: str) -> dict:
@@ -725,6 +738,7 @@ class PrivilegedService:
                 f"interface={interface}", "driver=nl80211", f"ctrl_interface={control_dir}", f"ssid={ssid}",
                 f"channel={channel}", "hw_mode=g" if channel <= 14 else "hw_mode=a",
                 f"country_code={domain if domain not in {None, 'unknown', '00'} else 'AT'}", "ieee80211d=1",
+                "macaddr_acl=0",
             ]
             if security == "wpa2":
                 hostapd_lines.extend(["wpa=2", f"wpa_passphrase={password}", "wpa_key_mgmt=WPA-PSK", "rsn_pairwise=CCMP"])
@@ -1038,26 +1052,208 @@ class PrivilegedService:
 
     def station_dump(self, interface: str) -> list[dict]:
         interface = self._interface(interface)
-        result = self.run(["iw", "dev", interface, "station", "dump"], check=False)
+        result = self.run(
+            ["iw", "dev", interface, "station", "dump"],
+            error_code="STATION_QUERY_FAILED",
+            error_message=f"Failed to read associated stations from {interface}.",
+            stage="ap_client_snapshot",
+        )
         stations: list[dict] = []
         current: dict | None = None
         for raw in result.stdout.splitlines():
             line = raw.strip()
             match = re.match(r"Station ([0-9a-fA-F:]{17})", line)
             if match:
-                current = {"mac": match.group(1).upper(), "rx_bytes": None, "tx_bytes": None}
+                current = {
+                    "mac": match.group(1).upper(),
+                    "ap_rx_bytes": None,
+                    "ap_tx_bytes": None,
+                    "ap_rx_packets": None,
+                    "ap_tx_packets": None,
+                    "signal_dbm": None,
+                    "inactive_ms": None,
+                    "connected_seconds": None,
+                    "authenticated": None,
+                    "authorized": None,
+                }
                 stations.append(current)
             elif current and line.startswith("rx bytes:"):
                 try:
-                    current["rx_bytes"] = int(line.split(":", 1)[1].strip())
+                    current["ap_rx_bytes"] = int(line.split(":", 1)[1].strip())
                 except ValueError:
-                    current["rx_bytes"] = None
+                    current["ap_rx_bytes"] = None
             elif current and line.startswith("tx bytes:"):
                 try:
-                    current["tx_bytes"] = int(line.split(":", 1)[1].strip())
+                    current["ap_tx_bytes"] = int(line.split(":", 1)[1].strip())
                 except ValueError:
-                    current["tx_bytes"] = None
+                    current["ap_tx_bytes"] = None
+            elif current and line.startswith("rx packets:"):
+                current["ap_rx_packets"] = self._integer_value(line)
+            elif current and line.startswith("tx packets:"):
+                current["ap_tx_packets"] = self._integer_value(line)
+            elif current and line.startswith("inactive time:"):
+                current["inactive_ms"] = self._integer_value(line)
+            elif current and line.startswith("connected time:"):
+                current["connected_seconds"] = self._integer_value(line)
+            elif current and line.startswith("signal:"):
+                signal = re.search(r"signal:\s*(-?\d+)", line)
+                current["signal_dbm"] = int(signal.group(1)) if signal else None
+            elif current and line.startswith("authenticated:"):
+                current["authenticated"] = line.split(":", 1)[1].strip().lower() == "yes"
+            elif current and line.startswith("authorized:"):
+                current["authorized"] = line.split(":", 1)[1].strip().lower() == "yes"
         return stations
+
+    @staticmethod
+    def _integer_value(line: str) -> int | None:
+        match = re.search(r":\s*(\d+)", line)
+        return int(match.group(1)) if match else None
+
+    @staticmethod
+    def _ap_ip(value: str) -> str | None:
+        try:
+            address = ipaddress.ip_address(value)
+        except ValueError:
+            return None
+        if not isinstance(address, ipaddress.IPv4Address):
+            return None
+        if address not in AP_NETWORK or address in {
+            AP_NETWORK.network_address,
+            AP_NETWORK.broadcast_address,
+            ipaddress.ip_address(AP_GATEWAY_IP),
+        }:
+            return None
+        return str(address)
+
+    def _dhcp_leases(self, session_dir: Path) -> dict[str, dict]:
+        path = session_dir / "dnsmasq-state" / "dnsmasq.leases"
+        try:
+            if path.stat().st_size > 2 * 1024 * 1024:
+                raise PinePiError("DHCP_LEASE_FILE_INVALID", "The AP DHCP lease file is unexpectedly large.", 500)
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except FileNotFoundError:
+            return {}
+        except OSError as exc:
+            raise PinePiError("DHCP_LEASE_QUERY_FAILED", "Unable to read AP DHCP leases.", 500) from exc
+        now = int(time.time())
+        leases: dict[str, dict] = {}
+        for line in lines:
+            parts = line.split()
+            if len(parts) < 4 or not CLIENT_MAC_PATTERN.fullmatch(parts[1]):
+                continue
+            try:
+                expires = int(parts[0])
+            except ValueError:
+                continue
+            ip_address = self._ap_ip(parts[2])
+            if ip_address is None or (expires != 0 and expires <= now):
+                continue
+            mac = parts[1].upper()
+            hostname = parts[3] if parts[3] != "*" else None
+            if hostname and (len(hostname) > 255 or any(ord(char) < 32 for char in hostname)):
+                hostname = None
+            candidate = {
+                "ip_address": ip_address,
+                "hostname": hostname,
+                "ip_source": "dhcp_lease",
+                "lease_expires_at": expires or None,
+            }
+            previous = leases.get(mac)
+            if previous is None or (expires or 2**63 - 1) > (previous["lease_expires_at"] or 2**63 - 1):
+                leases[mac] = candidate
+        return leases
+
+    def _neighbors(self, interface: str) -> dict[str, dict]:
+        result = self.run(["ip", "-j", "neigh", "show", "dev", interface], check=False)
+        if result.returncode != 0:
+            return {}
+        try:
+            rows = json.loads(result.stdout or "[]")
+        except json.JSONDecodeError:
+            return {}
+        neighbors: dict[str, dict] = {}
+        for row in rows if isinstance(rows, list) else []:
+            if not isinstance(row, dict):
+                continue
+            mac = str(row.get("lladdr") or "").upper()
+            ip_address = self._ap_ip(str(row.get("dst") or ""))
+            states = row.get("state") or []
+            if isinstance(states, str):
+                states = [states]
+            states = {str(state).upper() for state in states}
+            if not CLIENT_MAC_PATTERN.fullmatch(mac) or ip_address is None:
+                continue
+            if states & {"FAILED", "INCOMPLETE"}:
+                continue
+            neighbors[mac] = {
+                "ip_address": ip_address,
+                "hostname": None,
+                "ip_source": "neighbor",
+                "lease_expires_at": None,
+            }
+        return neighbors
+
+    def ap_client_snapshot(
+        self, interface: str, session_dir: Path, operation_id: str | None = None,
+    ) -> list[dict]:
+        """Return associated stations enriched by owned DHCP and neighbor state."""
+
+        interface = self._interface(interface)
+        session_dir = session_dir.resolve()
+        if not re.fullmatch(r"[a-f0-9]{32}", str(operation_id or "")) or session_dir.name != operation_id:
+            raise PinePiError("INVALID_OPERATION_ID", "Invalid AP session identifier.")
+        leases = self._dhcp_leases(session_dir)
+        neighbors = self._neighbors(interface)
+        stations = self.station_dump(interface)
+        for station in stations:
+            network = leases.get(station["mac"]) or neighbors.get(station["mac"]) or {
+                "ip_address": None,
+                "hostname": None,
+                "ip_source": None,
+                "lease_expires_at": None,
+            }
+            station.update(network)
+        return stations
+
+    def ap_client_action(
+        self, interface: str, session_dir: Path, operation_id: str, mac: str, action: str,
+    ) -> dict:
+        """Manage a station through the private control socket of PinePi's AP."""
+
+        interface = self._interface(interface)
+        session_dir = session_dir.resolve()
+        if not re.fullmatch(r"[a-f0-9]{32}", str(operation_id or "")) or session_dir.name != operation_id:
+            raise PinePiError("INVALID_OPERATION_ID", "Invalid AP session identifier.")
+        mac = normalize_client_mac(mac)
+        commands = {
+            "kick": ["deauthenticate", mac],
+            "block": ["deny_acl", "ADD_MAC", mac],
+            "unblock": ["deny_acl", "DEL_MAC", mac],
+        }
+        if action not in commands:
+            raise PinePiError("INVALID_CLIENT_ACTION", "Unsupported AP client action.")
+        result = self.run(
+            [
+                "hostapd_cli", "-p", str(session_dir / "hostapd-control"),
+                "-i", interface, *commands[action],
+            ],
+            check=False,
+        )
+        response = result.stdout.strip()
+        if result.returncode != 0 or response != "OK":
+            raise PinePiError(
+                "HOSTAPD_CLIENT_ACTION_FAILED",
+                f"hostapd could not {action} client {mac} on {interface}.",
+                502,
+                {
+                    "interface": interface,
+                    "mac": mac,
+                    "action": action,
+                    "exit_code": result.returncode,
+                    "response": self._bounded_text(response or result.stderr, 1024),
+                },
+            )
+        return {"interface": interface, "mac": mac, "action": action, "result": "OK"}
 
     def inspect_capture(self, path: Path) -> CommandResult:
         return self.run(["capinfos", "-c", "-M", str(path)], check=False, timeout=10)

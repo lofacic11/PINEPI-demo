@@ -96,6 +96,17 @@ def access_point_recommendation():
     ))
 
 
+@api.post("/access-point/clients/<mac>/kick")
+def access_point_client_kick(mac: str):
+    return success(services()["operations"].manage_ap_client(mac, "kick"))
+
+
+@api.route("/access-point/clients/<mac>/block", methods=["PUT", "DELETE"])
+def access_point_client_block(mac: str):
+    action = "block" if request.method == "PUT" else "unblock"
+    return success(services()["operations"].manage_ap_client(mac, action))
+
+
 @api.route("/target", methods=["GET", "PUT", "POST", "DELETE"])
 def current_target():
     ops = services()["operations"]

@@ -7,11 +7,12 @@ import os
 import re
 import signal
 import socketserver
+import threading
 from pathlib import Path
 
 from .config import Config
 from .errors import PinePiError
-from .privileged import OwnedProcess, PrivilegedService
+from .privileged import OwnedProcess, PrivilegedService, normalize_client_mac
 
 OPERATION_ID = re.compile(r"^[a-f0-9]{32}(?:-(?:traffic|hostapd|dnsmasq))?$")
 
@@ -21,6 +22,8 @@ class HelperState:
         self.data_dir = data_dir.resolve()
         self.privileged = PrivilegedService(runtime_dir or self.data_dir / "runtime", Config.COMMAND_TIMEOUT)
         self.processes: dict[str, OwnedProcess] = {}
+        self.access_points: dict[str, dict] = {}
+        self._dispatch_lock = threading.RLock()
 
     def operation_id(self, value) -> str:
         if not isinstance(value, str) or not OPERATION_ID.fullmatch(value):
@@ -49,7 +52,37 @@ class HelperState:
         self.processes[process.operation_id] = process
         return {"operation_id": process.operation_id, "pid": process.pid}
 
+    def active_ap(self, params: dict) -> tuple[str, str, Path]:
+        operation_id = self.operation_id(params.get("operation_id"))
+        if "-" in operation_id:
+            raise PinePiError("INVALID_OPERATION_ID", "An AP session identifier is required.")
+        interface = str(params.get("interface", ""))
+        session_dir = self.path(params.get("session_dir"), self.data_dir / "ap_sessions")
+        expected = (self.data_dir / "ap_sessions" / operation_id).resolve()
+        record = self.access_points.get(operation_id)
+        hostapd = self.processes.get(operation_id + "-hostapd")
+        if (
+            session_dir != expected
+            or not record
+            or record.get("interface") != interface
+            or record.get("session_dir") != str(session_dir)
+            or not hostapd
+            or not hostapd.alive()
+        ):
+            raise PinePiError(
+                "AP_NOT_ACTIVE",
+                "Client operations are permitted only for the active PinePi-hosted AP.",
+                409,
+            )
+        return operation_id, interface, session_dir
+
     def dispatch(self, action: str, params: dict):
+        # The helper server is threaded. Serialize all stateful process/AP
+        # operations so lifecycle transitions cannot race client commands.
+        with self._dispatch_lock:
+            return self._dispatch(action, params)
+
+    def _dispatch(self, action: str, params: dict):
         service = self.privileged
         if action == "wireless_info":
             return service.wireless_info(str(params.get("interface", "")))
@@ -99,11 +132,18 @@ class HelperState:
             session_dir = self.path(params.get("session_dir"), self.data_dir / "ap_sessions")
             if session_dir != (self.data_dir / "ap_sessions" / operation_id).resolve():
                 raise PinePiError("INVALID_STORAGE_PATH", "AP session path does not match its operation.", 403)
+            interface = str(params.get("interface", ""))
             hostapd, dnsmasq = service.start_ap(
-                str(params.get("interface", "")), params.get("ssid"), params.get("channel"),
+                interface, params.get("ssid"), params.get("channel"),
                 params.get("security"), params.get("password"), session_dir, operation_id,
             )
-            return {"hostapd": self.remember(hostapd), "dnsmasq": self.remember(dnsmasq)}
+            result = {"hostapd": self.remember(hostapd), "dnsmasq": self.remember(dnsmasq)}
+            self.access_points[operation_id] = {
+                "interface": interface,
+                "session_dir": str(session_dir),
+                "blocked_macs": set(),
+            }
+            return result
         if action == "setup_routing":
             operation_id = self.operation_id(params.get("operation_id"))
             return service.setup_routing(str(params.get("ap_interface", "")), str(params.get("uplink", "")), operation_id)
@@ -115,6 +155,38 @@ class HelperState:
             return {}
         if action == "station_dump":
             return service.station_dump(str(params.get("interface", "")))
+        if action == "ap_client_snapshot":
+            operation_id, interface, session_dir = self.active_ap(params)
+            return service.ap_client_snapshot(interface, session_dir, operation_id)
+        if action == "ap_client_action":
+            operation_id, interface, session_dir = self.active_ap(params)
+            client_action = str(params.get("client_action", ""))
+            mac = normalize_client_mac(str(params.get("mac", "")))
+            record = self.access_points[operation_id]
+            blocked_macs = record["blocked_macs"]
+            if client_action in {"kick", "block"}:
+                associated = {item["mac"] for item in service.station_dump(interface)}
+                if mac not in associated:
+                    raise PinePiError(
+                        "CLIENT_NOT_ASSOCIATED",
+                        "The client is not associated with the active PinePi AP.",
+                        404,
+                        {"mac": mac},
+                    )
+            elif client_action == "unblock" and mac not in blocked_macs:
+                raise PinePiError("CLIENT_NOT_BLOCKED", "The client is not blocked on this AP.", 409)
+            result = service.ap_client_action(
+                interface,
+                session_dir,
+                operation_id,
+                mac,
+                client_action,
+            )
+            if client_action == "block":
+                blocked_macs.add(mac)
+            elif client_action == "unblock":
+                blocked_macs.discard(mac)
+            return result
         if action == "inspect_capture":
             path = self.path(params.get("path"), self.data_dir / "captures", self.data_dir / "ap_sessions")
             if path.suffix not in {".pcap", ".pcapng"}:
@@ -129,6 +201,8 @@ class HelperState:
             operation_id = self.operation_id(params.get("operation_id"))
             process = self.processes.pop(operation_id, None)
             service.stop_process(process, min(max(float(params.get("grace", 3)), 0), 10))
+            if operation_id.endswith("-hostapd"):
+                self.access_points.pop(operation_id.removesuffix("-hostapd"), None)
             return {}
         if action == "record_restore":
             operation_id = self.operation_id(params.get("operation_id"))
@@ -141,14 +215,17 @@ class HelperState:
             for process in list(self.processes.values()):
                 service.stop_process(process)
             self.processes.clear()
+            self.access_points.clear()
             return service.reconcile_runtime()
         raise PinePiError("HELPER_ACTION_DENIED", "The requested helper action is not permitted.", 403)
 
     def cleanup(self) -> None:
-        for process in list(self.processes.values()):
-            self.privileged.stop_process(process)
-        self.processes.clear()
-        self.privileged.reconcile_runtime()
+        with self._dispatch_lock:
+            for process in list(self.processes.values()):
+                self.privileged.stop_process(process)
+            self.processes.clear()
+            self.access_points.clear()
+            self.privileged.reconcile_runtime()
 
 
 class RequestHandler(socketserver.StreamRequestHandler):

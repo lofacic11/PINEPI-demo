@@ -28,6 +28,7 @@ class FakePrivileged:
         self.fail_capture = False
         self.fail_ap = False
         self.fail_routing = False
+        self.fail_client_action = False
         self.stations = []
 
     def reconcile_runtime(self):
@@ -71,6 +72,14 @@ class FakePrivileged:
         return {"table": "pinepi_test", "previous_forwarding": "0"}
     def teardown_routing(self, routing): self.calls.append(("teardown_routing", routing))
     def station_dump(self, interface): return list(self.stations)
+    def ap_client_snapshot(self, interface, session_dir, operation_id):
+        self.calls.append(("ap_client_snapshot", interface, operation_id))
+        return [dict(item) for item in self.stations]
+    def ap_client_action(self, interface, session_dir, operation_id, mac, action):
+        self.calls.append(("ap_client_action", interface, operation_id, mac, action))
+        if self.fail_client_action:
+            raise PinePiError("HELPER_UNAVAILABLE", "Privileged helper unavailable.", 503)
+        return {"interface": interface, "mac": mac, "action": action, "result": "OK"}
     def inspect_capture(self, _path):
         class Result:
             returncode = 1

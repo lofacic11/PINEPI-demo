@@ -2,7 +2,7 @@
 
 PinePi is a Raspberry Pi wireless-auditing appliance for controlled, authorized cybersecurity education. Prototype v1 provides a responsive web interface for passive Recon, a controlled test Access Point, standalone packet capture, session exports, and operational logs.
 
-It is not an active-attack platform. It does not include deauthentication, credential collection, phishing, or automated evil-twin behavior.
+It is not an active-attack platform. It does not include credential collection, phishing, automated evil-twin behavior, or deauthentication of third-party networks. The only client-disconnect control is an administrative action against a station currently associated with PinePi's own hosted test AP.
 
 ## Hardware and network model
 
@@ -16,13 +16,28 @@ The management WLAN intentionally remains open for Prototype v1. Use PinePi only
 
 - Dashboard: live CPU, memory, filesystem, temperature, uptime, real interfaces, active operations, and the latest stored wireless landscape.
 - Recon: monitor-capable interface selection, live status, parsed airodump-ng AP/client observations, channel/security charts, searching, sorting, detail/association view, history, CSV, and JSON.
-- Access Point: AP-capable adapter selection, Open or WPA2-PSK, readable/copyable live passphrase, verified hostapd state, dnsmasq DHCP, automatic or explicit connected uplink, isolated nftables NAT state, real station/lease client tracking, optional AP-interface traffic capture, history, and ZIP export.
+- Access Point: AP-capable adapter selection, Open or WPA2-PSK, readable/copyable live passphrase, verified hostapd state, dnsmasq DHCP, automatic or explicit connected uplink, isolated nftables NAT state, per-client metadata and traffic tracking, Kick/Block/Unblock administration for the owned AP, optional AP-interface traffic capture, history, and ZIP export.
 - Capture: channel/name selection, bounded dumpcap PCAPNG capture, status/history, PCAP download, safe JSON analysis, and deletion.
 - Logs: structured, bounded event history with level/component/search filters and TXT/CSV/JSON exports.
 - Mobile UI: hamburger navigation and card-based alternatives for wide tables.
 - Storage safety: 250 MB default capture ceiling, minimum-free-space guard before and during capture, bounded application logs, streaming file downloads, and conservative PCAP inspection.
 
 AP ZIPs include only available session artifacts: `metadata.json`, `clients.csv`, `events.log`, and `traffic.pcapng`. WPA2 passphrases are never stored in the database, structured logs, or export metadata; the temporary hostapd configuration is deleted as soon as hostapd and dnsmasq are verified.
+
+### Access Point client accounting and administration
+
+PinePi reads per-station counters from `iw dev <interface> station dump`. Linux reports those counters from the AP's perspective: AP RX is data sent by the client, and AP TX is data sent to the client. PinePi normalizes the domain model, API, UI, and exports to the client perspective:
+
+- `download_bytes` / Download/RX is AP TX, meaning bytes received by the client.
+- `upload_bytes` / Upload/TX is AP RX, meaning bytes transmitted by the client.
+
+Totals are maintained independently per MAC and AP session. They accumulate deltas while an association is stable and preserve earlier bytes when a station reconnects and its kernel counters reset. A new AP session starts new totals. Starting or stopping packet capture does not alter station accounting; captures and station counters are independent observations and need not have identical byte totals.
+
+Database schema version 3 migrates legacy AP-side `rx_bytes` into `upload_bytes` and legacy AP-side `tx_bytes` into `download_bytes`. New API responses and exports intentionally use only the explicit names; legacy SQLite columns may remain in an upgraded database but are no longer exported.
+
+For an associated station, PinePi first correlates its MAC with a non-expired lease in that AP session's private dnsmasq lease file. If no valid lease exists, it may use a valid neighbor-table address on the same AP interface and `10.77.0.0/24` subnet. It never synthesizes an address, and a lease or neighbor entry alone is not treated as a connected station. IP and hostname can remain unavailable before DHCP completes, for static-IP clients, after an entry expires, or when neither source has a valid current mapping.
+
+Kick asks hostapd to deauthenticate the currently associated station once; it may reconnect normally. Block adds the station MAC to the runtime deny ACL of the active PinePi hostapd instance and disconnects it; Unblock removes that entry. Blocks last only for the active AP session. These commands are accepted only for the exact external interface, session directory, and live hostapd process owned by PinePi. They are never exposed for `wlan0`, arbitrary interfaces, or stations on third-party networks.
 
 ## Architecture
 

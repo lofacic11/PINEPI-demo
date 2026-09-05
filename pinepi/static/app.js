@@ -342,8 +342,27 @@ async function loadRecon() {
 }
 
 function renderApClients(clients) {
-  const list = $("#apClients"); clear(list); if (!clients.length) return empty(list, "No clients connected.");
-  clients.forEach((client) => { const row = element("div", "client"), info = element("div"); info.append(element("strong", "", client.mac), element("small", "", `${client.ip || "No DHCP address"} · connected ${fmtDuration(client.duration_seconds)}`)); row.append(info, element("div", "muted", `↓ ${fmtBytes(client.rx_bytes)}  ↑ ${fmtBytes(client.tx_bytes)}`)); list.append(row); });
+  const list = $("#apClients"); clear(list); if (!clients.length) return empty(list, "No associated or blocked clients.");
+  clients.forEach((client) => {
+    const card = element("div", "ap-client-card"), heading = element("div", "ap-client-heading"), identity = element("div");
+    const ipLabel = client.ip_address ? (client.association_state === "associated" ? client.ip_address : `Last IP ${client.ip_address}`) : "No current IP address";
+    identity.append(element("strong", "", client.mac), element("small", "", `${client.hostname || "Unknown device"} · ${ipLabel}`));
+    heading.append(identity, statusPill(client.association_state || "unknown", client.blocked ? "warn" : ""));
+    const metrics = element("div", "ap-client-metrics");
+    [["Signal", client.signal_dbm === null || client.signal_dbm === undefined ? "—" : `${client.signal_dbm} dBm`], ["Download / RX", fmtBytes(client.download_bytes)], ["Upload / TX", fmtBytes(client.upload_bytes)], ["Connection", fmtDuration(client.connection_duration_seconds)]].forEach(([label, value]) => { const item = element("span", "", label); item.append(element("strong", "", value)); metrics.append(item); });
+    const actions = element("div", "actions ap-client-actions"), details = element("details", "ap-client-details"), summary = element("summary", "btn", "Details");
+    const detailGrid = element("div", "network-meta");
+    [["IP source", client.ip_source || "Unavailable"], ["First seen", fmtDate(client.first_seen)], ["Last seen", fmtDate(client.last_seen)], ["Associations", client.association_count || 1], ["Inactive", client.inactive_ms === null || client.inactive_ms === undefined ? "—" : `${client.inactive_ms} ms`], ["Authenticated", client.authenticated === null || client.authenticated === undefined ? "Unknown" : (client.authenticated ? "Yes" : "No")], ["Authorized", client.authorized === null || client.authorized === undefined ? "Unknown" : (client.authorized ? "Yes" : "No")], ["AP received (current association)", fmtBytes(client.ap_rx_bytes)], ["AP transmitted (current association)", fmtBytes(client.ap_tx_bytes)]].forEach(([label, value]) => { const item = element("span", "", label); item.append(element("strong", "", value)); detailGrid.append(item); });
+    details.append(summary, detailGrid);
+    const runClientAction = (action, method, label) => {
+      const button = element("button", `btn ${action === "block" ? "danger" : ""}`.trim(), label); button.type = "button";
+      button.disabled = action !== "unblock" && client.association_state !== "associated";
+      button.addEventListener("click", () => { if (!window.confirm(`${label} ${client.mac}?`)) return; perform(button, async () => { await api(`/access-point/clients/${encodeURIComponent(client.mac)}/${action === "kick" ? "kick" : "block"}`, {method}); }); });
+      return button;
+    };
+    actions.append(details, runClientAction("kick", "POST", "Kick"), client.blocked ? runClientAction("unblock", "DELETE", "Unblock") : runClientAction("block", "PUT", "Block"));
+    card.append(heading, metrics, actions); list.append(card);
+  });
 }
 function mobileHistoryCard(title, badge, fields, actions = []) {
   const card = element("div", "network-card"), head = element("div", "network-card-head"); head.append(element("strong", "", title), statusPill(badge, "blue")); const grid = element("div", "network-card-grid");
@@ -379,6 +398,8 @@ async function loadAp() {
   }
   else if (state.apError) setNotice($("#apNotice"), state.apError, "error");
   else setNotice($("#apNotice"), "Access Point is stopped. Temporary routing and capture state are clear.");
+  const totals = status.traffic_totals || {};
+  $("#apTrafficTotals").textContent = `Session totals: ${fmtBytes(totals.download_bytes)} download · ${fmtBytes(totals.upload_bytes)} upload`;
   renderApClients(status.clients || []); renderApHistory(data.history);
 }
 

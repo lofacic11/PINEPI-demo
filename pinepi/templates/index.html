@@ -121,7 +121,11 @@
           <div class="actions field-gap"><button class="btn primary" id="apBtn">Start Access Point</button></div>
           <div class="notice notice-gap" id="apNotice">Loading Access Point state…</div>
         </div>
-        <div class="section-title">Connected Clients</div><div class="card"><div class="client-list" id="apClients"><div class="empty">No clients connected.</div></div></div>
+        <div class="title-row client-section-title">
+          <div><div class="section-title">Connected Clients</div><div class="subtitle">Download/RX and Upload/TX are shown from the client perspective.</div></div>
+          <div class="inline-stat" id="apTrafficTotals">Session totals: 0 B download · 0 B upload</div>
+        </div>
+        <div class="card"><div class="client-list" id="apClients"><div class="empty">No associated or blocked clients.</div></div></div>
         <div class="section-title">Session History</div><div class="table-wrap"><table><thead><tr><th>SSID</th><th>Started</th><th>Interface</th><th>Uplink</th><th>Status</th><th>Export</th></tr></thead><tbody id="apHistory"></tbody></table></div><div class="mobile-cards" id="apHistoryCards"></div>
       </section>
 

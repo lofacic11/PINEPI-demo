@@ -82,3 +82,22 @@ def test_targeted_and_raw_capture_modes_preserve_truthful_capture_semantics():
     assert 'gotoPage("capture")' in script
     assert 'target: mode === "targeted"' in script
     assert "No free compatible monitor-capable adapter." in script
+
+
+def test_ap_clients_use_client_oriented_metrics_and_owned_ap_actions():
+    root = Path(__file__).parents[1]
+    template = (root / "pinepi" / "templates" / "index.html").read_text(encoding="utf-8")
+    script = (root / "pinepi" / "static" / "app.js").read_text(encoding="utf-8")
+    styles = (root / "pinepi" / "static" / "app.css").read_text(encoding="utf-8")
+
+    assert "Download/RX and Upload/TX are shown from the client perspective." in template
+    assert 'id="apTrafficTotals"' in template
+    assert 'client.download_bytes' in script
+    assert 'client.upload_bytes' in script
+    assert 'client.ip_address' in script
+    assert 'client.hostname' in script
+    assert 'runClientAction("kick", "POST", "Kick")' in script
+    assert 'runClientAction("unblock", "DELETE", "Unblock")' in script
+    assert 'runClientAction("block", "PUT", "Block")' in script
+    assert "ap-client-metrics" in styles
+    assert "ap-client-actions" in styles

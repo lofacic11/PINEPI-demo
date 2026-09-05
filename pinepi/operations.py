@@ -9,7 +9,7 @@ import time
 import uuid
 from collections import Counter
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import psutil
@@ -18,7 +18,7 @@ from .adapters import AdapterService, Reservation, ReservationRegistry
 from .db import Database
 from .errors import PinePiError, require
 from .events import EventLog
-from .privileged import OwnedProcess, PrivilegedService
+from .privileged import OwnedProcess, PrivilegedService, normalize_client_mac
 
 BSSID_PATTERN = re.compile(r"^(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$")
 AP_AUTO_24_CHANNELS = (1, 6, 11)
@@ -119,6 +119,7 @@ class ActiveAP:
     recommendation_reason: str = ""
     state: str = "RUNNING"
     connected_macs: set[str] = field(default_factory=set)
+    blocked_macs: set[str] = field(default_factory=set)
 
 
 class OperationService:
@@ -1256,7 +1257,10 @@ class OperationService:
             self.db.execute("UPDATE ap_sessions SET status='STOPPING' WHERE id=?", (active.id,))
             cleanup_ok = True
             try:
-                cleanup_ok &= self._cleanup_call("access_point", active.id, "save_clients", lambda: self._save_ap_clients(active))
+                # Telemetry is best effort during shutdown. A dead hostapd makes
+                # the helper intentionally reject a station snapshot, but that
+                # must not misreport successful interface/routing cleanup.
+                self._cleanup_call("access_point", active.id, "save_clients", lambda: self._save_ap_clients(active))
                 cleanup_ok &= self._cleanup_call("access_point", active.id, "stop_capture", lambda: self.privileged.stop_process(active.capture))
                 routing_removed = self._cleanup_call("access_point", active.id, "teardown_routing", lambda: self.privileged.teardown_routing(active.routing))
                 cleanup_ok &= routing_removed
@@ -1293,8 +1297,25 @@ class OperationService:
     def ap_status(self) -> dict:
         active = self._ap
         if not active:
-            return {"state": "IDLE", "active": False, "elapsed_seconds": 0, "clients": []}
+            return {
+                "state": "IDLE", "active": False, "elapsed_seconds": 0, "clients": [],
+                "traffic_totals": {"download_bytes": 0, "upload_bytes": 0},
+                "client_counter_semantics": self._client_counter_semantics(),
+            }
         clients = self._read_ap_clients(active)
+        persisted = {
+            item["mac"]: item
+            for item in self.db.fetchall(
+                "SELECT mac,download_bytes,upload_bytes FROM ap_clients WHERE session_id=?",
+                (active.id,),
+            )
+        }
+        for client in clients:
+            persisted[client["mac"]] = client
+        traffic_totals = {
+            "download_bytes": sum(item.get("download_bytes") or 0 for item in persisted.values()),
+            "upload_bytes": sum(item.get("upload_bytes") or 0 for item in persisted.values()),
+        }
         capture_size = active.capture_path.stat().st_size if active.capture_path and active.capture_path.exists() else 0
         return {
             "state": active.state, "active": True, "session_id": active.id, "interface": active.interface,
@@ -1306,59 +1327,258 @@ class OperationService:
             "requested_uplink": active.requested_uplink, "effective_uplink": active.effective_uplink,
             "started_at": active.started_at, "elapsed_seconds": elapsed_seconds(active.started_at),
             "clients": clients, "capture_traffic": active.capture_traffic, "capture_size_bytes": capture_size,
+            "traffic_totals": traffic_totals,
+            "client_counter_semantics": self._client_counter_semantics(),
             "hostapd_alive": active.hostapd.alive(), "dnsmasq_alive": active.dnsmasq.alive(),
         }
 
     def ap_history(self) -> list[dict]:
         return self.db.fetchall("SELECT * FROM ap_sessions ORDER BY started_at DESC LIMIT 100")
 
-    def _read_ap_clients(self, active: ActiveAP) -> list[dict]:
-        stations = {item["mac"]: item for item in self.privileged.station_dump(active.interface)}
-        leases: dict[str, str] = {}
-        path = active.session_dir / "dnsmasq-state" / "dnsmasq.leases"
-        try:
-            if path.stat().st_size <= 2 * 1024 * 1024:
-                for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-                    parts = line.split()
-                    if len(parts) >= 3 and re.fullmatch(r"[0-9A-Fa-f:]{17}", parts[1]):
-                        leases[parts[1].upper()] = parts[2]
-        except OSError:
-            pass
-        now = utcnow()
-        known = {row["mac"]: row for row in self.db.fetchall("SELECT * FROM ap_clients WHERE session_id=?", (active.id,))}
+    @staticmethod
+    def _nonnegative_counter(value) -> int | None:
+        return value if isinstance(value, int) and value >= 0 else None
+
+    @staticmethod
+    def _client_counter_semantics() -> dict:
+        return {
+            "download_bytes": "Bytes transmitted by the AP to the client (AP TX / client RX).",
+            "upload_bytes": "Bytes received by the AP from the client (AP RX / client TX).",
+            "ap_rx_bytes": "Latest kernel per-association counter for bytes received by the AP.",
+            "ap_tx_bytes": "Latest kernel per-association counter for bytes transmitted by the AP.",
+            "scope": "Accumulated per MAC for this AP session across detected associations.",
+        }
+
+    @staticmethod
+    def _association_reset(previous: dict | None, station: dict) -> bool:
+        if not previous:
+            return False
+        current_connected = OperationService._nonnegative_counter(station.get("connected_seconds"))
+        previous_connected = OperationService._nonnegative_counter(previous.get("last_connected_seconds"))
+        if current_connected is not None and previous_connected is not None and current_connected < previous_connected:
+            return True
+        for key in ("ap_rx_bytes", "ap_tx_bytes"):
+            current = OperationService._nonnegative_counter(station.get(key))
+            old = OperationService._nonnegative_counter(previous.get(key))
+            if current is not None and old is not None and current < old:
+                return True
+        return False
+
+    @staticmethod
+    def _accumulate_counter(previous: dict | None, total_key: str, raw_key: str, current, reset: bool) -> int:
+        value = OperationService._nonnegative_counter(current)
+        previous_total = int(previous.get(total_key) or 0) if previous else 0
+        if value is None:
+            return previous_total
+        if not previous or reset:
+            return previous_total + value
+        previous_raw = OperationService._nonnegative_counter(previous.get(raw_key))
+        return previous_total + (value if previous_raw is None else max(0, value - previous_raw))
+
+    @staticmethod
+    def _connected_at(now: datetime, station: dict, previous: dict | None, reset: bool) -> str:
+        if previous and not reset and previous.get("connected_at"):
+            return previous["connected_at"]
+        connected_seconds = OperationService._nonnegative_counter(station.get("connected_seconds"))
+        return (now - timedelta(seconds=connected_seconds or 0)).isoformat()
+
+    def _merge_ap_clients(self, active: ActiveAP) -> tuple[list[dict], set[str]]:
+        stations = self.privileged.ap_client_snapshot(active.interface, active.session_dir, active.id)
+        known = {
+            row["mac"]: row
+            for row in self.db.fetchall("SELECT * FROM ap_clients WHERE session_id=?", (active.id,))
+        }
+        now_value = datetime.now(UTC)
+        now = now_value.isoformat()
         clients: list[dict] = []
-        for mac, station in stations.items():
+        associated_macs: set[str] = set()
+        observed_macs: set[str] = set()
+        for station in stations:
+            mac = normalize_client_mac(station.get("mac", ""))
+            observed_macs.add(mac)
             previous = known.get(mac)
-            first_seen = previous["first_seen"] if previous else now
-            clients.append({
-                "mac": mac, "ip": leases.get(mac), "first_seen": first_seen, "last_seen": now,
-                "duration_seconds": elapsed_seconds(first_seen), "rx_bytes": station.get("rx_bytes"),
-                "tx_bytes": station.get("tx_bytes"),
-            })
+            reset = self._association_reset(previous, station)
+            ap_rx_bytes = self._nonnegative_counter(station.get("ap_rx_bytes"))
+            ap_tx_bytes = self._nonnegative_counter(station.get("ap_tx_bytes"))
+            association_count = max(1, int(previous.get("association_count") or 0)) if previous else 1
+            if reset:
+                association_count += 1
+            blocked = mac in active.blocked_macs or bool(previous and previous.get("blocked"))
+            if not blocked:
+                associated_macs.add(mac)
+            client = {
+                "mac": mac,
+                "ip_address": station.get("ip_address"),
+                "hostname": station.get("hostname"),
+                "ip_source": station.get("ip_source"),
+                "first_seen": previous.get("first_seen") if previous else now,
+                "last_seen": now,
+                "connected_at": self._connected_at(now_value, station, previous, reset),
+                "disconnected_at": None,
+                "association_state": "blocked" if blocked else "associated",
+                "association_count": association_count,
+                "signal_dbm": station.get("signal_dbm"),
+                "inactive_ms": self._nonnegative_counter(station.get("inactive_ms")),
+                "authenticated": station.get("authenticated"),
+                "authorized": station.get("authorized"),
+                # Linux reports station counters from the local AP perspective:
+                # AP TX is client download; AP RX is client upload.
+                "download_bytes": self._accumulate_counter(
+                    previous, "download_bytes", "ap_tx_bytes", ap_tx_bytes, reset,
+                ),
+                "upload_bytes": self._accumulate_counter(
+                    previous, "upload_bytes", "ap_rx_bytes", ap_rx_bytes, reset,
+                ),
+                "ap_rx_bytes": ap_rx_bytes,
+                "ap_tx_bytes": ap_tx_bytes,
+                "last_connected_seconds": self._nonnegative_counter(station.get("connected_seconds")),
+                "connection_duration_seconds": self._nonnegative_counter(station.get("connected_seconds")),
+                "blocked": blocked,
+                "blocked_at": previous.get("blocked_at") if previous else None,
+                "ap_rx_packets": self._nonnegative_counter(station.get("ap_rx_packets")),
+                "ap_tx_packets": self._nonnegative_counter(station.get("ap_tx_packets")),
+            }
+            clients.append(client)
+        for mac in sorted(active.blocked_macs - observed_macs):
+            previous = known.get(mac)
+            if previous:
+                clients.append({
+                    **previous,
+                    "association_state": "blocked",
+                    "blocked": True,
+                    "connection_duration_seconds": previous.get("last_connected_seconds"),
+                    "ap_rx_packets": None,
+                    "ap_tx_packets": None,
+                })
+        clients.sort(key=lambda item: (not item.get("blocked"), item["mac"]))
+        return clients, associated_macs
+
+    def _read_ap_clients(self, active: ActiveAP) -> list[dict]:
+        clients, _associated = self._merge_ap_clients(active)
         return clients
 
+    def _persist_ap_client(self, session_id: str, client: dict) -> None:
+        self.db.execute(
+            "INSERT INTO ap_clients(session_id,mac,ip_address,hostname,ip_source,first_seen,last_seen,"
+            "connected_at,disconnected_at,association_state,association_count,signal_dbm,inactive_ms,"
+            "authenticated,authorized,download_bytes,upload_bytes,ap_rx_bytes,ap_tx_bytes,"
+            "last_connected_seconds,blocked,blocked_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(session_id,mac) DO UPDATE SET ip_address=excluded.ip_address,"
+            "hostname=excluded.hostname,ip_source=excluded.ip_source,last_seen=excluded.last_seen,"
+            "connected_at=excluded.connected_at,disconnected_at=excluded.disconnected_at,"
+            "association_state=excluded.association_state,association_count=excluded.association_count,"
+            "signal_dbm=excluded.signal_dbm,inactive_ms=excluded.inactive_ms,"
+            "authenticated=excluded.authenticated,authorized=excluded.authorized,"
+            "download_bytes=excluded.download_bytes,upload_bytes=excluded.upload_bytes,"
+            "ap_rx_bytes=excluded.ap_rx_bytes,ap_tx_bytes=excluded.ap_tx_bytes,"
+            "last_connected_seconds=excluded.last_connected_seconds,blocked=excluded.blocked,"
+            "blocked_at=excluded.blocked_at",
+            (
+                session_id, client["mac"], client.get("ip_address"), client.get("hostname"),
+                client.get("ip_source"), client["first_seen"], client["last_seen"],
+                client.get("connected_at"), client.get("disconnected_at"),
+                client["association_state"], client["association_count"], client.get("signal_dbm"),
+                client.get("inactive_ms"),
+                None if client.get("authenticated") is None else int(client["authenticated"]),
+                None if client.get("authorized") is None else int(client["authorized"]),
+                client["download_bytes"], client["upload_bytes"], client.get("ap_rx_bytes"),
+                client.get("ap_tx_bytes"), client.get("last_connected_seconds"),
+                int(bool(client.get("blocked"))), client.get("blocked_at"),
+            ),
+        )
+
     def _save_ap_clients(self, active: ActiveAP) -> None:
-        if not active.log_clients:
-            return
-        clients = self._read_ap_clients(active)
-        current_macs = {client["mac"] for client in clients}
-        for mac in sorted(current_macs - active.connected_macs):
-            self.events.write(
-                "INFO", "access_point", "client_connected", "Client connected to the test access point.",
-                session_id=active.id, interface=active.interface, mac=mac,
-            )
-        for mac in sorted(active.connected_macs - current_macs):
-            self.events.write(
-                "INFO", "access_point", "client_disconnected", "Client disconnected from the test access point.",
-                session_id=active.id, interface=active.interface, mac=mac,
-            )
+        clients, current_macs = self._merge_ap_clients(active)
+        if active.log_clients:
+            for mac in sorted(current_macs - active.connected_macs):
+                self.events.write(
+                    "INFO", "access_point", "client_connected", "Client connected to the test access point.",
+                    session_id=active.id, interface=active.interface, mac=mac,
+                )
+            for mac in sorted(active.connected_macs - current_macs):
+                self.events.write(
+                    "INFO", "access_point", "client_disconnected", "Client disconnected from the test access point.",
+                    session_id=active.id, interface=active.interface, mac=mac,
+                )
         active.connected_macs = current_macs
         for client in clients:
-            self.db.execute(
-                "INSERT INTO ap_clients(session_id,mac,ip,first_seen,last_seen,rx_bytes,tx_bytes) VALUES(?,?,?,?,?,?,?) "
-                "ON CONFLICT(session_id,mac) DO UPDATE SET ip=excluded.ip,last_seen=excluded.last_seen,rx_bytes=excluded.rx_bytes,tx_bytes=excluded.tx_bytes",
-                (active.id, client["mac"], client["ip"], client["first_seen"], client["last_seen"], client["rx_bytes"], client["tx_bytes"]),
+            self._persist_ap_client(active.id, client)
+        disconnected_at = utcnow()
+        for row in self.db.fetchall(
+            "SELECT mac,blocked,association_state FROM ap_clients WHERE session_id=?", (active.id,),
+        ):
+            if row["mac"] in current_macs or row["mac"] in active.blocked_macs:
+                continue
+            if row["association_state"] == "associated":
+                self.db.execute(
+                    "UPDATE ap_clients SET association_state='disconnected',disconnected_at=? "
+                    "WHERE session_id=? AND mac=?",
+                    (disconnected_at, active.id, row["mac"]),
+                )
+
+    def manage_ap_client(self, mac: str, action: str) -> dict:
+        mac = normalize_client_mac(mac)
+        require(action in {"kick", "block", "unblock"}, "INVALID_CLIENT_ACTION", "Unsupported AP client action.")
+        with self._ap_lock:
+            active = self._ap
+            if not active or active.state != "RUNNING":
+                raise PinePiError(
+                    "AP_NOT_ACTIVE", "Client management requires an active PinePi-hosted Access Point.", 409,
+                )
+            clients = {item["mac"]: item for item in self._read_ap_clients(active)}
+            client = clients.get(mac)
+            blocked = mac in active.blocked_macs or bool(client and client.get("blocked"))
+            if action == "block" and blocked:
+                return {"mac": mac, "action": action, "association_state": "blocked", "changed": False}
+            if action == "unblock":
+                if not blocked:
+                    raise PinePiError("CLIENT_NOT_BLOCKED", "The client is not blocked on this AP.", 409)
+            elif not client or client.get("association_state") != "associated":
+                raise PinePiError(
+                    "CLIENT_NOT_ASSOCIATED", "The client is not associated with the active PinePi AP.", 404,
+                    {"mac": mac},
+                )
+
+            if client:
+                self._persist_ap_client(active.id, client)
+            self.privileged.ap_client_action(active.interface, active.session_dir, active.id, mac, action)
+            changed_at = utcnow()
+            if action == "block":
+                active.blocked_macs.add(mac)
+                active.connected_macs.discard(mac)
+                self.db.execute(
+                    "UPDATE ap_clients SET blocked=1,blocked_at=?,association_state='blocked',"
+                    "disconnected_at=? WHERE session_id=? AND mac=?",
+                    (changed_at, changed_at, active.id, mac),
+                )
+                association_state = "blocked"
+            elif action == "unblock":
+                active.blocked_macs.discard(mac)
+                self.db.execute(
+                    "UPDATE ap_clients SET blocked=0,blocked_at=NULL,association_state='disconnected' "
+                    "WHERE session_id=? AND mac=?",
+                    (active.id, mac),
+                )
+                association_state = "disconnected"
+            else:
+                active.connected_macs.discard(mac)
+                self.db.execute(
+                    "UPDATE ap_clients SET association_state='disconnected',disconnected_at=? "
+                    "WHERE session_id=? AND mac=?",
+                    (changed_at, active.id, mac),
+                )
+                association_state = "disconnected"
+            self.events.write(
+                "INFO", "access_point", f"client_{action}",
+                f"AP client {action} completed.",
+                session_id=active.id, interface=active.interface, mac=mac,
             )
+            return {
+                "mac": mac,
+                "action": action,
+                "association_state": association_state,
+                "changed": True,
+            }
 
     # Background lifecycle monitoring. GET status calls deliberately never perform cleanup.
     def _watch(self, kind: str, operation_id: str) -> None:
@@ -1388,19 +1608,19 @@ class OperationService:
                         self.stop_capture(reason)
                         return
                 elif kind == "ap":
-                    active = self._ap
-                    if not active or active.id != operation_id:
-                        return
-                    if active.log_clients:
-                        self._save_ap_clients(active)
-                    if not active.hostapd.alive() or not active.dnsmasq.alive():
-                        self.stop_ap("process_exit")
-                        return
-                    if active.capture and active.capture_path:
-                        reason = self._capture_guard(active.capture_path, active.capture)
-                        if reason:
-                            self.stop_ap(reason)
+                    with self._ap_lock:
+                        active = self._ap
+                        if not active or active.id != operation_id:
                             return
+                        if not active.hostapd.alive() or not active.dnsmasq.alive():
+                            self.stop_ap("process_exit")
+                            return
+                        self._save_ap_clients(active)
+                        if active.capture and active.capture_path:
+                            reason = self._capture_guard(active.capture_path, active.capture)
+                            if reason:
+                                self.stop_ap(reason)
+                                return
                 consecutive_errors = 0
             # A monitor must survive any OS/parser/database exception long enough to log it.
             except Exception as exc:  # noqa: BLE001
