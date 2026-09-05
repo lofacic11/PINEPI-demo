@@ -81,18 +81,29 @@ class FakePrivileged:
 class FakeAdapters:
     def __init__(self):
         self.names = {"wlan1", "wlan2"}
+        self.ap_channels = [1, 6, 11, 36, 40, 44, 48]
 
     def require_wireless(self, interface, capability):
         if interface == MANAGEMENT_INTERFACE:
             raise PinePiError("MANAGEMENT_INTERFACE_RESERVED", "reserved", 409)
         if interface not in self.names:
             raise PinePiError("ADAPTER_NOT_FOUND", "not found", 404)
-        return {"name": interface, f"{capability}_capable": True}
+        return {
+            "name": interface,
+            f"{capability}_capable": True,
+            "wireless": True,
+            "usable": True,
+            "busy": False,
+            "reserved": False,
+            "monitor_capable": True,
+            "ap_capable": True,
+            "capabilities": {"ap_channels": list(self.ap_channels)},
+        }
 
     def require_ap_channel(self, interface, channel):
         if interface not in self.names:
             raise PinePiError("ADAPTER_NOT_FOUND", "not found", 404)
-        if channel not in {1, 6, 11, 36, 40, 44, 48}:
+        if channel not in self.ap_channels:
             raise PinePiError("UNSUPPORTED_CHANNEL", "unsupported channel", 409)
         return {"name": interface, "channel": channel}
 

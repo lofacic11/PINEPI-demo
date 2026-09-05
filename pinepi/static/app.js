@@ -4,6 +4,7 @@ const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
 const state = {
   page: "dashboard", interfaces: [], recon: null, selectedNetworkKey: null, apError: null,
+  currentTarget: null, apRecommendation: null, capturePrefill: false,
   reconSort: {key: "signal", direction: -1}, pending: false, refreshing: false,
 };
 
@@ -65,6 +66,17 @@ function gotoPage(id) {
   history.replaceState(null, "", `#${id}`); window.scrollTo({top: 0, behavior: "smooth"}); refreshPage();
 }
 
+function bandLabel(band) { return band === "2.4" ? "2.4 GHz" : (band === "5" ? "5 GHz" : "Unknown band"); }
+function renderCurrentTarget(target) {
+  state.currentTarget = target?.selected ? target : null;
+  const indicator = $("#currentTargetIndicator"); indicator.classList.toggle("hidden", !state.currentTarget);
+  if (!state.currentTarget) return;
+  $("#currentTargetName").textContent = state.currentTarget.ssid || "<hidden>";
+  const observed = state.currentTarget.currently_observed ? "Observed now" : `Last seen ${state.currentTarget.last_seen_age_seconds === null ? "unknown" : `${fmtDuration(state.currentTarget.last_seen_age_seconds)} ago`}`;
+  $("#currentTargetMeta").textContent = `${state.currentTarget.bssid} · CH ${state.currentTarget.channel} · ${bandLabel(state.currentTarget.band)} · ${observed}`;
+}
+async function loadCurrentTarget() { renderCurrentTarget(await api("/target")); }
+
 function option(value, label) { const node = element("option", "", label); node.value = value; return node; }
 function fillSelect(node, items, predicate, label, placeholder, forceValue = null) {
   const selected = forceValue ?? node.value; clear(node);
@@ -98,14 +110,22 @@ function apUnavailableReason(item) {
 async function loadInterfaces(active = {}) {
   const data = await api(`/interfaces${active.apInterface ? `?ap_interface=${encodeURIComponent(active.apInterface)}` : ""}`);
   state.interfaces = data.interfaces;
-  const monitorOk = (item) => item.wireless && item.monitor_capable && !item.reserved && (item.usable || item.role === active.reconRole || item.role === active.captureRole);
+  const targetChannel = Number(active.captureTargetChannel || 0);
+  const monitorChannelOk = (item) => !targetChannel || !item.capabilities?.ap_channels?.length || item.capabilities.ap_channels.includes(targetChannel);
+  const monitorOk = (item) => item.wireless && item.monitor_capable && !item.reserved && (item.usable || item.role === active.reconRole || item.role === active.captureRole) && monitorChannelOk(item);
   fillSelect($("#reconInterface"), data.interfaces, monitorOk, (item) => `${item.name} — ${item.description}`, "No free monitor-capable adapter", active.reconInterface);
   fillSelect($("#captureInterface"), data.interfaces, monitorOk, (item) => `${item.name} — ${item.description}`, "No free monitor-capable adapter", active.captureInterface);
+  data.interfaces.filter((item) => item.wireless && item.monitor_capable && !item.reserved && !monitorOk(item)).forEach((item) => {
+    const reason = item.busy && item.role !== active.captureRole
+      ? `busy with ${(item.current_operation || item.role).replaceAll("_", " ")}`
+      : (!monitorChannelOk(item) ? `channel ${targetChannel} not advertised` : (item.reason || "not ready"));
+    const unavailable = option(item.name, `${item.name} — Unavailable: ${reason}`); unavailable.disabled = true; $("#captureInterface").append(unavailable);
+  });
   fillSelect($("#apInterface"), data.interfaces, apSelectable, (item) => `${item.name} — ${item.description}`, "No selectable AP adapter", active.apInterface);
   data.interfaces.filter((item) => item.wireless && !apSelectable(item)).forEach((item) => {
     const unavailable = option(item.name, `${item.name} — ${apUnavailableReason(item)}`); unavailable.disabled = true; $("#apInterface").append(unavailable);
   });
-  updateApChannels(active.apChannel);
+  await updateApConfiguration(active.apBand, active.apChannel, active.apChannelMode);
   const apHint = $("#apCapabilityHint");
   const unavailableAdapters = data.interfaces.filter((item) => item.wireless && !apSelectable(item));
   const diagnosticAdapter = unavailableAdapters.find((item) => item.ap_capable && item.usable && apChannelState(item) === "unknown")
@@ -126,14 +146,43 @@ async function loadInterfaces(active = {}) {
   });
 }
 
-function updateApChannels(forceValue = null) {
-  const select = $("#apChannel"), adapter = state.interfaces.find((item) => item.name === $("#apInterface").value);
-  const selected = forceValue ?? Number(select.value || 6); clear(select);
+async function updateApConfiguration(forceBand = null, forceChannel = null, forceMode = null) {
+  const adapter = state.interfaces.find((item) => item.name === $("#apInterface").value);
   const channels = [...new Set(adapter?.capabilities?.ap_channels || [])].sort((a, b) => a - b);
-  if (!channels.length) { select.append(option("", "No supported AP channels")); select.disabled = true; return; }
-  channels.forEach((channel) => select.append(option(String(channel), String(channel))));
-  select.disabled = false;
-  if (channels.includes(Number(selected))) select.value = String(selected);
+  const reportedBands = adapter?.capabilities?.ap_channels_by_band;
+  const groups = {
+    "2.4": reportedBands ? [...new Set(reportedBands["2.4"] || [])].sort((a, b) => a - b) : channels.filter((channel) => channel >= 1 && channel <= 14),
+    "5": reportedBands ? [...new Set(reportedBands["5"] || [])].sort((a, b) => a - b) : channels.filter((channel) => channel >= 32 && channel <= 177),
+  };
+  const bandSelect = $("#apBand"), previousBand = forceBand ?? bandSelect.value || "auto"; clear(bandSelect);
+  bandSelect.append(option("auto", "Auto"));
+  if (groups["2.4"].length) bandSelect.append(option("2.4", "2.4 GHz"));
+  if (groups["5"].length) bandSelect.append(option("5", "5 GHz"));
+  bandSelect.value = [...bandSelect.options].some((item) => item.value === previousBand) ? previousBand : "auto";
+  const channelMode = $("#apChannelMode"); if (forceMode) channelMode.value = forceMode;
+  const manual = channelMode.value === "manual"; $("#apManualChannelField").classList.toggle("hidden", !manual);
+  const selectedGroup = bandSelect.value === "auto" ? [...new Set([...groups["2.4"], ...groups["5"]])].sort((a, b) => a - b) : groups[bandSelect.value];
+  const channelSelect = $("#apChannel"), previousChannel = Number(forceChannel ?? channelSelect.value); clear(channelSelect);
+  if (!selectedGroup.length) channelSelect.append(option("", "No supported AP channels"));
+  selectedGroup.forEach((channel) => channelSelect.append(option(String(channel), String(channel))));
+  if (selectedGroup.includes(previousChannel)) channelSelect.value = String(previousChannel);
+  channelSelect.disabled = !manual || !selectedGroup.length;
+  state.apRecommendation = null;
+  if (!adapter) {
+    setNotice($("#apRecommendation"), "Select an AP adapter to calculate a recommendation.", "warning");
+    return;
+  }
+  if (!manual) {
+    try {
+      const recommendation = await api(`/access-point/recommendation?interface=${encodeURIComponent(adapter.name)}&band=${encodeURIComponent(bandSelect.value)}`);
+      state.apRecommendation = recommendation;
+      setNotice($("#apRecommendation"), `Recommendation: ${bandLabel(recommendation.resolved_band)} · Channel ${recommendation.resolved_channel} · ${recommendation.recommendation_reason}`);
+    } catch (error) {
+      setNotice($("#apRecommendation"), error.message, "warning");
+    }
+  } else {
+    setNotice($("#apRecommendation"), channelSelect.value ? `Manual selection: ${bandLabel(bandSelect.value === "auto" ? (Number(channelSelect.value) <= 14 ? "2.4" : "5") : bandSelect.value)} · Channel ${channelSelect.value}` : "No manual channel is available.", "warning");
+  }
 }
 
 async function loadDashboard() {
@@ -177,15 +226,62 @@ function renderChart(node, values) {
   entries.forEach(([label, count]) => { const row = element("div", "chart-row"), track = element("div", "chart-bar"), bar = element("span"); bar.style.width = `${(Number(count) / maximum) * 100}%`; track.append(bar); row.append(element("span", "", label), track, element("strong", "", count)); node.append(row); });
 }
 function networkKey(ap) { return ap.bssid || `${ap.ssid || "<hidden>"}:${ap.channel ?? ""}`; }
+function compatibleCaptureAdapters(ap) {
+  return state.interfaces.filter((item) => item.wireless && item.monitor_capable && item.usable && !item.busy && !item.reserved
+    && (!item.capabilities?.ap_channels?.length || item.capabilities.ap_channels.includes(Number(ap.channel))));
+}
+function actionButton(label, callback, available = true, reason = "") {
+  const button = element("button", "btn network-action", available ? label : `${label} · Unavailable`); button.type = "button";
+  button.disabled = !available; if (reason) button.title = reason;
+  button.addEventListener("click", (event) => { event.stopPropagation(); callback(event); }); return button;
+}
+async function selectTarget(ap, rerender = true) {
+  const target = await api("/target", {method: "PUT", body: JSON.stringify({bssid: ap.bssid})});
+  renderCurrentTarget(target); state.selectedNetworkKey = ap.bssid;
+  if (rerender && state.recon) renderReconResults(state.recon);
+  return target;
+}
+function resultList(node, title, values, tone = "") {
+  clear(node); const head = element("div", "action-result-head"); head.append(element("strong", "", title)); if (tone) head.append(statusPill(tone, tone === "Risk" ? "red" : (tone === "Warning" ? "warn" : ""))); node.append(head);
+  const list = element("ul", "finding-list"); values.forEach((value) => list.append(element("li", "", value))); node.append(list);
+}
 function networkDetails(ap, className = "") {
   const detail = element("div", `network-detail ${className}`.trim());
-  detail.append(element("h3", "", ap.ssid || "<hidden>"));
+  const title = element("div", "network-detail-title"); title.append(element("h3", "", ap.ssid || "<hidden>"));
+  if (ap.is_current_target || state.currentTarget?.bssid === ap.bssid) title.append(statusPill("Current Target"));
+  if (ap.bookmarked) title.append(statusPill(ap.label || "Bookmarked", "blue")); detail.append(title);
   const meta = element("div", "network-meta");
-  [["BSSID", ap.bssid], ["Channel", ap.channel ?? "—"], ["Signal", ap.signal === null ? "—" : `${ap.signal} dBm`], ["Security", ap.security || "Unknown"], ["First seen", ap.first_seen || "—"], ["Last seen", ap.last_seen || "—"]].forEach(([label, value]) => { const item = element("span", "", label); item.append(element("strong", "", value)); meta.append(item); });
-  detail.append(meta, element("div", "section-title", "Associated observed clients"));
-  const clients = (state.recon?.clients || []).filter((item) => item.bssid === ap.bssid);
-  if (!clients.length) detail.append(element("div", "empty", "No client association was observable for this network."));
-  clients.forEach((client) => { const row = element("div", "client"), info = element("div"); info.append(element("strong", "", client.mac), element("small", "", `Signal ${client.signal ?? "—"} dBm · last seen ${client.last_seen || "—"}`)); row.append(info); detail.append(row); });
+  [["BSSID", ap.bssid], ["Channel", `${ap.channel ?? "—"} · ${bandLabel(ap.band)}`], ["Frequency", ap.frequency ? `${ap.frequency} MHz` : "—"], ["Signal", ap.signal === null ? "—" : `${ap.signal} dBm`], ["Security", ap.security || "Unknown"], ["First seen", ap.first_seen || "—"], ["Last seen", ap.last_seen || "—"]].forEach(([label, value]) => { const item = element("span", "", label); item.append(element("strong", "", value)); meta.append(item); });
+  detail.append(meta);
+  const actionResult = element("div", "network-action-result hidden");
+  const runAction = async (callback) => { try { await callback(); } catch (error) { showError(error); } };
+  const captureAdapters = compatibleCaptureAdapters(ap), captureReason = captureAdapters.length ? "" : "No free compatible monitor-capable adapter.";
+  const monitorAvailable = Boolean(state.reconStatus?.active), monitorReason = monitorAvailable ? "" : "Start Recon to provide live passive observations.";
+  const monitoringThis = state.networkMonitor?.active && state.networkMonitor.bssid === ap.bssid;
+  const primary = element("div", "network-primary-actions");
+  primary.append(
+    actionButton("Set Target", () => runAction(async () => { await selectTarget(ap); }), true),
+    actionButton("Passive Audit", () => runAction(async () => { const audit = await api(`/networks/${encodeURIComponent(ap.bssid)}/audit`); resultList(actionResult, "Passive security assessment", audit.reasons, audit.assessment); actionResult.classList.remove("hidden"); }), true),
+    actionButton("Capture", () => runAction(async () => { await selectTarget(ap, false); state.capturePrefill = true; gotoPage("capture"); }), Boolean(captureAdapters.length), captureReason),
+    actionButton(monitoringThis ? "Stop Monitor" : "Monitor", () => runAction(async () => { if (monitoringThis) { state.networkMonitor = await api("/monitor", {method: "DELETE"}); resultList(actionResult, "Passive monitor stopped", ["No active monitoring session remains."]); } else { await selectTarget(ap, false); const monitor = await api("/monitor", {method: "POST", body: JSON.stringify({bssid: ap.bssid})}); state.networkMonitor = monitor; resultList(actionResult, "Passive monitor started", ["Recon observations will track presence, signal, channel, security, and observed client-count changes."], "Good"); } actionResult.classList.remove("hidden"); }), monitorAvailable, monitorReason),
+  );
+  const more = element("details", "network-more"), summary = element("summary", "", "More"); more.append(summary);
+  const secondary = element("div", "network-secondary-actions");
+  secondary.append(
+    actionButton("View Clients", () => runAction(async () => { const clients = await api(`/networks/${encodeURIComponent(ap.bssid)}/clients`); clear(actionResult); actionResult.append(element("strong", "", "Observed clients/stations")); if (!clients.length) actionResult.append(element("div", "empty", "No station relationship is available for this BSSID.")); clients.forEach((client) => { const row = element("div", "client field-gap"), info = element("div"); info.append(element("strong", "", client.mac), element("small", "", `${client.relationship} · ${client.association} · Signal ${client.signal ?? "—"} dBm`)); row.append(info); actionResult.append(row); }); actionResult.classList.remove("hidden"); }), true),
+    actionButton("Rogue / Duplicate Check", () => runAction(async () => { const report = await api(`/networks/${encodeURIComponent(ap.bssid)}/duplicates`); const findings = report.matches.length ? report.matches.map((match) => `${match.network.bssid}: ${match.assessment}. ${match.differences.map((item) => `${item.field} differs`).join(", ") || "No major capability difference observed"}. Requires verification.`) : [report.conclusion]; resultList(actionResult, "Duplicate SSID check", findings, report.matches.length ? "Warning" : "Good"); actionResult.classList.remove("hidden"); }), true),
+    actionButton("Technical Details", () => { resultList(actionResult, "Technical details", [`BSSID ${ap.bssid}`, `Channel ${ap.channel} (${ap.frequency || "unknown"} MHz)`, `${bandLabel(ap.band)} · ${ap.security || "Unknown"}`, `Signal ${ap.signal ?? "unknown"} dBm`, `First seen ${ap.first_seen || "unknown"}`, `Last seen ${ap.last_seen || "unknown"}`]); actionResult.classList.remove("hidden"); }, true),
+    actionButton("Add Note / Bookmark", () => runAction(async () => {
+      const note = await api(`/networks/${encodeURIComponent(ap.bssid)}/note`); clear(actionResult);
+      const form = element("div", "note-editor"), bookmarkLabel = element("label", "toggle"), bookmark = document.createElement("input"); bookmark.type = "checkbox"; bookmark.checked = Boolean(note.bookmarked); bookmarkLabel.append(bookmark, document.createTextNode(" Bookmark network"));
+      const label = document.createElement("select"); label.append(option("", "No label")); ["test target", "trusted", "investigate", "lab AP"].forEach((value) => label.append(option(value, value))); label.value = note.label || "";
+      const textarea = document.createElement("textarea"); textarea.maxLength = 500; textarea.placeholder = "Short note"; textarea.value = note.note || "";
+      const save = actionButton("Save", () => runAction(async () => { await api(`/networks/${encodeURIComponent(ap.bssid)}/note`, {method: "PUT", body: JSON.stringify({bookmarked: bookmark.checked, label: label.value, note: textarea.value})}); await loadRecon(); }), true);
+      const remove = actionButton("Remove", () => runAction(async () => { await api(`/networks/${encodeURIComponent(ap.bssid)}/note`, {method: "DELETE"}); await loadRecon(); }), true); remove.classList.add("danger");
+      const buttons = element("div", "actions"); buttons.append(save, remove); form.append(bookmarkLabel, label, textarea, buttons); actionResult.append(element("strong", "", "Note and bookmark"), form); actionResult.classList.remove("hidden");
+    }), true),
+  );
+  more.append(secondary); detail.append(primary, more, actionResult);
   return detail;
 }
 function toggleNetwork(ap) {
@@ -196,6 +292,7 @@ function toggleNetwork(ap) {
 function networkCard(ap) {
   const wrapper = element("div", "network-accordion"), card = element("button", "network-card selectable-card"), head = element("div", "network-card-head"); card.type = "button";
   const expanded = state.selectedNetworkKey === networkKey(ap); card.setAttribute("aria-expanded", String(expanded));
+  card.classList.toggle("current-target", ap.is_current_target || state.currentTarget?.bssid === ap.bssid);
   head.append(element("strong", "", ap.ssid || "<hidden>"), statusPill(ap.security || "Unknown", (ap.security || "").toLowerCase() === "open" ? "warn" : ""));
   const grid = element("div", "network-card-grid"); [["Channel", ap.channel ?? "—"], ["Signal", ap.signal === null ? "—" : `${ap.signal} dBm`], ["Clients", ap.client_count || 0], ["BSSID", ap.bssid]].forEach(([key, value]) => { const span = element("span", "", key); span.append(document.createElement("br"), element("strong", "", value)); grid.append(span); });
   card.append(head, grid); card.addEventListener("click", () => toggleNetwork(ap)); wrapper.append(card);
@@ -212,6 +309,7 @@ function renderReconResults(results) {
   if (!aps.length) { const row = element("tr"), cell = element("td", "empty", "No access points observed."); cell.colSpan = 7; row.append(cell); tbody.append(row); empty(cards, "No access points observed."); }
   aps.forEach((ap) => {
     const row = element("tr", "selectable");
+    row.classList.toggle("current-target", ap.is_current_target || state.currentTarget?.bssid === ap.bssid);
     const signal = element("div", "signal", ap.signal === null ? "—" : `${ap.signal} dBm`), mini = element("div", "bar-mini"), bar = element("span"); bar.style.width = `${Math.min(100, Math.max(0, (Number(ap.signal) + 100) * 2))}%`; mini.append(bar); signal.append(mini);
     [ap.ssid || "<hidden>", ap.bssid, ap.channel ?? "—"].forEach((value, index) => { const td = element("td", "", value); if (index === 0) { const strong = element("strong", "", value); clear(td); td.append(strong); } row.append(td); });
     const signalCell = element("td"); signalCell.append(signal); row.append(signalCell);
@@ -226,10 +324,18 @@ function renderReconResults(results) {
 }
 async function loadRecon() {
   const data = await api("/recon"); const status = data.status;
+  state.reconStatus = status; state.networkMonitor = data.monitor; renderCurrentTarget(data.target);
   await loadInterfaces({reconInterface: status.interface, reconRole: "recon"});
   $("#reconBtn").textContent = status.active ? "Stop Recon" : "Start Recon"; $("#reconBtn").className = `btn full ${status.active ? "danger" : "primary"}`;
   $("#reconInterface").disabled = status.active || !$("#reconInterface").value; $("#reconMode").disabled = status.active; $("#reconBtn").disabled = !status.active && !$("#reconInterface").value;
   setNotice($("#reconNotice"), status.active ? `Scanning on ${status.interface} · elapsed ${fmtDuration(status.elapsed_seconds)}${status.process_alive === false ? " · process stopped, cleanup pending" : ""}` : "No Recon operation is active.", status.process_alive === false ? "warning" : "");
+  const monitorNotice = $("#monitorNotice"); monitorNotice.classList.toggle("hidden", !data.monitor?.active);
+  if (data.monitor?.active) {
+    const snapshot = data.monitor.snapshot || {}, presence = snapshot.present ? "present" : "currently not observed";
+    setNotice(monitorNotice, `Monitoring ${data.monitor.ssid || data.monitor.bssid} · ${presence} · ${data.monitor.observation_count} observations · ${data.monitor.changes?.length || 0} changes`);
+    const stopMonitor = element("button", "btn monitor-stop", "Stop Monitor"); stopMonitor.type = "button";
+    stopMonitor.addEventListener("click", () => perform(stopMonitor, async () => { await api("/monitor", {method: "DELETE"}); })); monitorNotice.append(stopMonitor);
+  }
   const selector = $("#reconSession"), selected = selector.value; clear(selector); selector.append(option("", "Latest/current"));
   data.history.forEach((session) => selector.append(option(session.id, `${fmtDate(session.started_at)} · ${session.interface} · ${session.status}`))); if ([...selector.options].some((item) => item.value === selected)) selector.value = selected;
   if (!selector.value) renderReconResults(data.results);
@@ -255,13 +361,22 @@ function renderApHistory(history) {
 }
 async function loadAp() {
   const data = await api("/access-point"), status = data.status;
-  await loadInterfaces({apInterface: status.interface, apChannel: status.channel, requestedUplink: status.requested_uplink});
+  await loadInterfaces({
+    apInterface: status.interface, apChannel: status.channel,
+    apBand: status.requested_band,
+    apChannelMode: status.requested_channel ? (status.requested_channel === "auto" ? "auto" : "manual") : null,
+    requestedUplink: status.requested_uplink,
+  });
   const running = status.active; $("#apBtn").textContent = running ? "Stop Access Point" : "Start Access Point"; $("#apBtn").className = `btn ${running ? "danger" : "primary"}`;
-  ["#apInterface", "#apSsid", "#apChannel", "#apSecurity", "#apPassword", "#apUplink", "#apForwarding", "#apLogClients", "#apCaptureTraffic"].forEach((id) => { $(id).disabled = running; });
-  if (!running) updateApChannels(status.channel);
-  $("#apInterface").disabled = running || !$("#apInterface").value; $("#apBtn").disabled = !running && (!$("#apInterface").value || !$("#apChannel").value);
+  ["#apInterface", "#apSsid", "#apBand", "#apChannelMode", "#apChannel", "#apSecurity", "#apPassword", "#apUplink", "#apForwarding", "#apLogClients", "#apCaptureTraffic"].forEach((id) => { $(id).disabled = running; });
+  $("#apInterface").disabled = running || !$("#apInterface").value;
+  const autoChannel = $("#apChannelMode").value === "auto";
+  $("#apBtn").disabled = !running && (!$("#apInterface").value || (autoChannel ? !state.apRecommendation : !$("#apChannel").value));
   if (!running && $("#apUplink").value === "none") { $("#apForwarding").checked = false; $("#apForwarding").disabled = true; }
-  if (running) setNotice($("#apNotice"), `${status.ssid} is active on ${status.interface} · ${status.security.toUpperCase()} · uplink ${status.effective_uplink || "none"} · elapsed ${fmtDuration(status.elapsed_seconds)} · traffic ${fmtBytes(status.capture_size_bytes)}`, status.hostapd_alive && status.dnsmasq_alive ? "" : "warning");
+  if (running) {
+    setNotice($("#apRecommendation"), `Selected: ${bandLabel(status.resolved_band)} · Channel ${status.resolved_channel} · ${status.recommendation_reason}`);
+    setNotice($("#apNotice"), `${status.ssid} is active on ${status.interface} · ${bandLabel(status.resolved_band)} CH ${status.channel} · ${status.security.toUpperCase()} · uplink ${status.effective_uplink || "none"} · elapsed ${fmtDuration(status.elapsed_seconds)} · traffic ${fmtBytes(status.capture_size_bytes)}`, status.hostapd_alive && status.dnsmasq_alive ? "" : "warning");
+  }
   else if (state.apError) setNotice($("#apNotice"), state.apError, "error");
   else setNotice($("#apNotice"), "Access Point is stopped. Temporary routing and capture state are clear.");
   renderApClients(status.clients || []); renderApHistory(data.history);
@@ -276,17 +391,39 @@ function renderCaptureHistory(history) {
     const actions = element("div", "actions"), pcap = actionLink("PCAP", `/api/captures/${encodeURIComponent(capture.id)}/download`), summary = actionLink("JSON", `/api/captures/${encodeURIComponent(capture.id)}/summary.json`), remove = element("button", "btn danger", "Delete");
     const deleteAction = async () => { if (!window.confirm(`Delete capture “${capture.name}”?`)) return; try { await api(`/captures/${encodeURIComponent(capture.id)}`, {method: "DELETE"}); await loadCapture(); } catch (error) { showError(error); } };
     remove.addEventListener("click", deleteAction); actions.append(pcap, summary, remove);
-    const row = element("tr"); [capture.name, fmtDate(capture.started_at), fmtDuration(duration), capture.packet_count ?? "—", fmtBytes(capture.size_bytes), capture.status].forEach((value) => row.append(element("td", "", value))); const td = element("td"); td.append(actions); row.append(td); tbody.append(row);
+    const historyName = capture.capture_mode === "targeted" ? `${capture.name} · ${capture.target_ssid || capture.target_bssid}` : capture.name;
+    const row = element("tr"); [historyName, fmtDate(capture.started_at), fmtDuration(duration), capture.packet_count ?? "—", fmtBytes(capture.size_bytes), capture.status].forEach((value) => row.append(element("td", "", value))); const td = element("td"); td.append(actions); row.append(td); tbody.append(row);
     const mobileRemove = element("button", "btn danger", "Delete"); mobileRemove.addEventListener("click", deleteAction);
     const mobileActions = [actionLink("PCAP", pcap.href), actionLink("JSON", summary.href), mobileRemove]; cards.append(mobileHistoryCard(capture.name, fmtBytes(capture.size_bytes), [["Duration", fmtDuration(duration)], ["Packets", capture.packet_count ?? "—"], ["Status", capture.status]], mobileActions));
   });
 }
+function renderCaptureTarget(target) {
+  const panel = $("#captureTargetDetails"); clear(panel);
+  if (!target?.selected && !target?.bssid) return empty(panel, "No current target. Choose a network in Recon.");
+  [["Target SSID", target.ssid || "<hidden>"], ["BSSID", target.bssid], ["Channel", target.channel], ["Band", bandLabel(target.band)], ["Frequency", target.frequency ? `${target.frequency} MHz` : "—"], ["Security", target.security || "Unknown"]].forEach(([label, value]) => { const item = element("span", "", label); item.append(element("strong", "", value)); panel.append(item); });
+}
+function updateCaptureModeUI() {
+  const targeted = $("#captureMode").value === "targeted";
+  $("#captureTargetPanel").classList.toggle("hidden", !targeted);
+  $("#rawCaptureChannelField").classList.toggle("hidden", targeted);
+  const missingTarget = targeted && !state.currentTarget;
+  $("#captureBtn").disabled = !$("#captureBtn").textContent.startsWith("Stop") && (!$("#captureInterface").value || missingTarget);
+}
 async function loadCapture() {
-  const data = await api("/captures"), status = data.status; await loadInterfaces({captureInterface: status.interface, captureRole: "capture"});
+  const data = await api("/captures"), status = data.status;
+  if (status.active && status.target) renderCurrentTarget({selected: true, ...status.target});
+  if (!status.active && state.capturePrefill && state.currentTarget) $("#captureMode").value = "targeted";
+  if (!status.active && !state.currentTarget && $("#captureMode").value === "targeted") $("#captureMode").value = "raw";
+  const selectedTarget = status.target || state.currentTarget;
+  renderCaptureTarget(selectedTarget);
+  await loadInterfaces({captureInterface: status.interface, captureRole: "capture", captureTargetChannel: $("#captureMode").value === "targeted" ? selectedTarget?.channel : null});
   $("#captureBtn").textContent = status.active ? "Stop Capture" : "Start Capture"; $("#captureBtn").className = `btn full ${status.active ? "danger" : "primary"}`;
-  ["#captureInterface", "#captureChannel", "#captureName"].forEach((id) => { $(id).disabled = status.active; });
-  $("#captureInterface").disabled = status.active || !$("#captureInterface").value; $("#captureBtn").disabled = !status.active && !$("#captureInterface").value;
-  setNotice($("#captureNotice"), status.active ? `Capturing on ${status.interface} · CH ${status.channel} · ${fmtBytes(status.size_bytes)} · elapsed ${fmtDuration(status.elapsed_seconds)}` : "No standalone capture is active.", status.process_alive === false ? "warning" : ""); renderCaptureHistory(data.history);
+  ["#captureMode", "#captureInterface", "#captureChannel", "#captureName"].forEach((id) => { $(id).disabled = status.active; });
+  $("#captureInterface").disabled = status.active || !$("#captureInterface").value;
+  updateCaptureModeUI();
+  const targetText = status.capture_mode === "targeted" && status.target ? ` · target ${status.target.ssid} (${status.target.bssid})` : " · raw channel capture";
+  setNotice($("#captureNotice"), status.active ? `Capturing on ${status.interface} · CH ${status.channel}${targetText} · ${fmtBytes(status.size_bytes)} · elapsed ${fmtDuration(status.elapsed_seconds)}` : ($("#captureMode").value === "targeted" ? "Choose a free adapter, then start a target-associated capture. Capture continues until manually stopped." : "Raw mode captures all visible 802.11 traffic on the selected channel until manually stopped."), status.process_alive === false ? "warning" : "");
+  state.capturePrefill = false; renderCaptureHistory(data.history);
 }
 
 function logQuery() { const params = new URLSearchParams(); if ($("#logLevel").value) params.set("level", $("#logLevel").value); if ($("#logComponent").value) params.set("component", $("#logComponent").value); if ($("#logSearch").value.trim()) params.set("search", $("#logSearch").value.trim()); return params; }
@@ -300,6 +437,7 @@ async function refreshPage() {
   if (state.pending || state.refreshing) return;
   state.refreshing = true;
   try {
+    await loadCurrentTarget();
     if (state.page === "dashboard") await loadDashboard();
     if (state.page === "recon") await loadRecon();
     if (state.page === "ap") await loadAp();
@@ -319,12 +457,18 @@ $$('[data-goto]').forEach((button) => button.addEventListener("click", () => got
 $("#menuBtn").addEventListener("click", () => { $("#sidebar").classList.toggle("open"); $("#overlay").classList.toggle("show"); });
 $("#overlay").addEventListener("click", () => { $("#sidebar").classList.remove("open"); $("#overlay").classList.remove("show"); });
 $("#apSecurity").addEventListener("change", () => $("#apPasswordField").classList.toggle("hidden", $("#apSecurity").value !== "wpa2"));
-$("#apInterface").addEventListener("change", () => { updateApChannels(); $("#apCapabilityHint").textContent = ""; $("#apBtn").disabled = !$("#apInterface").value || !$("#apChannel").value; });
+$("#apInterface").addEventListener("change", async () => { await updateApConfiguration(); $("#apCapabilityHint").textContent = ""; $("#apBtn").disabled = !$("#apInterface").value || ($("#apChannelMode").value === "auto" ? !state.apRecommendation : !$("#apChannel").value); });
+$("#apBand").addEventListener("change", () => updateApConfiguration());
+$("#apChannelMode").addEventListener("change", () => updateApConfiguration());
+$("#apChannel").addEventListener("change", () => updateApConfiguration());
 $("#apUplink").addEventListener("change", () => { const noUplink = $("#apUplink").value === "none"; if (noUplink) $("#apForwarding").checked = false; $("#apForwarding").disabled = noUplink; });
 $("#copyApPassword").addEventListener("click", async () => { if (!$("#apPassword").value) { $("#copyStatus").textContent = "Nothing to copy."; return; } try { await navigator.clipboard.writeText($("#apPassword").value); $("#copyStatus").textContent = "Password copied."; } catch (_error) { $("#apPassword").select(); document.execCommand("copy"); $("#copyStatus").textContent = "Password copied."; } });
+$("#clearTarget").addEventListener("click", () => perform($("#clearTarget"), async () => { renderCurrentTarget(await api("/target", {method: "DELETE"})); }));
+$("#captureMode").addEventListener("change", () => { state.capturePrefill = false; loadCapture().catch(showError); });
+$("#changeCaptureTarget").addEventListener("click", () => gotoPage("recon"));
 $("#reconBtn").addEventListener("click", () => perform($("#reconBtn"), async () => { const active = $("#reconBtn").textContent.startsWith("Stop"); await api("/recon", active ? {method: "DELETE"} : {method: "POST", body: JSON.stringify({interface: $("#reconInterface").value, mode: $("#reconMode").value})}); }));
-$("#apBtn").addEventListener("click", () => perform($("#apBtn"), async () => { const active = $("#apBtn").textContent.startsWith("Stop"); state.apError = null; if (active) return api("/access-point", {method: "DELETE"}); await api("/access-point", {method: "POST", body: JSON.stringify({interface: $("#apInterface").value, ssid: $("#apSsid").value, channel: Number($("#apChannel").value), security: $("#apSecurity").value, password: $("#apPassword").value, uplink: $("#apUplink").value, forwarding: $("#apForwarding").checked && $("#apUplink").value !== "none", log_clients: $("#apLogClients").checked, capture_traffic: $("#apCaptureTraffic").checked})}); }, (error) => { state.apError = error.message || "Access Point failed to start."; }));
-$("#captureBtn").addEventListener("click", () => perform($("#captureBtn"), async () => { const active = $("#captureBtn").textContent.startsWith("Stop"); await api("/captures", active ? {method: "DELETE"} : {method: "POST", body: JSON.stringify({interface: $("#captureInterface").value, channel: Number($("#captureChannel").value), name: $("#captureName").value})}); }));
+$("#apBtn").addEventListener("click", () => perform($("#apBtn"), async () => { const active = $("#apBtn").textContent.startsWith("Stop"); state.apError = null; if (active) return api("/access-point", {method: "DELETE"}); await api("/access-point", {method: "POST", body: JSON.stringify({interface: $("#apInterface").value, ssid: $("#apSsid").value, band: $("#apBand").value, channel: $("#apChannelMode").value === "auto" ? "auto" : Number($("#apChannel").value), security: $("#apSecurity").value, password: $("#apPassword").value, uplink: $("#apUplink").value, forwarding: $("#apForwarding").checked && $("#apUplink").value !== "none", log_clients: $("#apLogClients").checked, capture_traffic: $("#apCaptureTraffic").checked})}); }, (error) => { state.apError = error.message || "Access Point failed to start."; }));
+$("#captureBtn").addEventListener("click", () => perform($("#captureBtn"), async () => { const active = $("#captureBtn").textContent.startsWith("Stop"); const mode = $("#captureMode").value; await api("/captures", active ? {method: "DELETE"} : {method: "POST", body: JSON.stringify({interface: $("#captureInterface").value, channel: mode === "raw" ? Number($("#captureChannel").value) : state.currentTarget?.channel, name: $("#captureName").value, mode, target: mode === "targeted" ? {bssid: state.currentTarget?.bssid} : null})}); }));
 $("#reconSearch").addEventListener("input", () => { if (state.recon) renderReconResults(state.recon); });
 $$('#recon th[data-sort]').forEach((header) => header.addEventListener("click", () => { const key = header.dataset.sort; state.reconSort.direction = state.reconSort.key === key ? state.reconSort.direction * -1 : 1; state.reconSort.key = key; if (state.recon) renderReconResults(state.recon); }));
 $("#reconSession").addEventListener("change", async () => { try { if (!$("#reconSession").value) return loadRecon(); renderReconResults(await api(`/recon/${encodeURIComponent($("#reconSession").value)}`)); } catch (error) { showError(error); } });

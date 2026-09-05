@@ -60,7 +60,11 @@ def recon():
         return success(ops.start_recon(str(data.get("interface", "")), str(data.get("mode", "normal"))), 201)
     if request.method == "DELETE":
         return success(ops.stop_recon())
-    return success({"status": ops.recon_status(), "results": ops.recon_results(), "history": ops.recon_history()})
+    return success({
+        "status": ops.recon_status(), "results": ops.recon_results(),
+        "history": ops.recon_history(), "target": ops.current_target(),
+        "monitor": ops.network_monitor_status(),
+    })
 
 
 @api.get("/recon/<session_id>")
@@ -85,6 +89,58 @@ def access_point():
     return success({"status": ops.ap_status(), "history": ops.ap_history()})
 
 
+@api.get("/access-point/recommendation")
+def access_point_recommendation():
+    return success(services()["operations"].ap_recommendation(
+        str(request.args.get("interface", "")), str(request.args.get("band", "auto")),
+    ))
+
+
+@api.route("/target", methods=["GET", "PUT", "POST", "DELETE"])
+def current_target():
+    ops = services()["operations"]
+    if request.method == "DELETE":
+        return success(ops.clear_current_target())
+    if request.method in {"PUT", "POST"}:
+        return success(ops.set_current_target(body()))
+    return success(ops.current_target())
+
+
+@api.get("/networks/<bssid>/audit")
+def network_audit(bssid: str):
+    return success(services()["operations"].passive_audit(bssid))
+
+
+@api.get("/networks/<bssid>/clients")
+def network_clients(bssid: str):
+    return success(services()["operations"].observed_clients(bssid))
+
+
+@api.get("/networks/<bssid>/duplicates")
+def network_duplicates(bssid: str):
+    return success(services()["operations"].duplicate_check(bssid))
+
+
+@api.route("/networks/<bssid>/note", methods=["GET", "PUT", "DELETE"])
+def network_note(bssid: str):
+    ops = services()["operations"]
+    if request.method == "PUT":
+        return success(ops.update_network_note(bssid, body()))
+    if request.method == "DELETE":
+        return success(ops.delete_network_note(bssid))
+    return success(ops.network_note(bssid))
+
+
+@api.route("/monitor", methods=["GET", "POST", "DELETE"])
+def network_monitor():
+    ops = services()["operations"]
+    if request.method == "POST":
+        return success(ops.start_network_monitor(body()), 201)
+    if request.method == "DELETE":
+        return success(ops.stop_network_monitor())
+    return success(ops.network_monitor_status())
+
+
 @api.get("/access-point/<session_id>/export.zip")
 def ap_export(session_id: str):
     exporter = ExportService(services()["database"], services()["events"], services()["operations"])
@@ -99,11 +155,11 @@ def captures():
     ops = services()["operations"]
     if request.method == "POST":
         data = body()
-        try:
-            channel = int(data.get("channel", 6))
-        except (TypeError, ValueError):
-            raise PinePiError("INVALID_CHANNEL", "Channel must be a number.")
-        return success(ops.start_capture(str(data.get("interface", "")), channel, str(data.get("name", "capture"))), 201)
+        return success(ops.start_capture(
+            str(data.get("interface", "")), data.get("channel", 6),
+            str(data.get("name", "capture")), str(data.get("mode", "raw")),
+            data.get("target") if isinstance(data.get("target"), dict) else None,
+        ), 201)
     if request.method == "DELETE":
         return success(ops.stop_capture())
     return success({"status": ops.capture_status(), "history": ops.capture_history()})

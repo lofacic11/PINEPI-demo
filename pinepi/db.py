@@ -7,7 +7,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 class Database:
@@ -57,7 +57,10 @@ class Database:
                     requested_uplink TEXT, effective_uplink TEXT, security TEXT NOT NULL,
                     channel INTEGER NOT NULL, started_at TEXT NOT NULL, ended_at TEXT,
                     status TEXT NOT NULL, log_clients INTEGER NOT NULL,
-                    capture_traffic INTEGER NOT NULL, capture_path TEXT, stop_reason TEXT
+                    capture_traffic INTEGER NOT NULL, capture_path TEXT, stop_reason TEXT,
+                    requested_band TEXT, resolved_band TEXT, requested_channel TEXT,
+                    resolved_channel INTEGER, channel_score REAL,
+                    recommendation_reason TEXT
                 );
                 CREATE TABLE IF NOT EXISTS ap_clients (
                     session_id TEXT NOT NULL REFERENCES ap_sessions(id) ON DELETE CASCADE,
@@ -69,7 +72,28 @@ class Database:
                     id TEXT PRIMARY KEY, name TEXT NOT NULL, interface TEXT NOT NULL,
                     channel INTEGER NOT NULL, started_at TEXT NOT NULL, ended_at TEXT,
                     status TEXT NOT NULL, path TEXT NOT NULL, packet_count INTEGER,
-                    size_bytes INTEGER NOT NULL DEFAULT 0, stop_reason TEXT
+                    size_bytes INTEGER NOT NULL DEFAULT 0, stop_reason TEXT,
+                    capture_mode TEXT NOT NULL DEFAULT 'raw', target_bssid TEXT,
+                    target_ssid TEXT, target_frequency INTEGER, target_band TEXT,
+                    target_security TEXT, target_last_seen TEXT
+                );
+                CREATE TABLE IF NOT EXISTS current_target (
+                    id INTEGER PRIMARY KEY CHECK(id = 1), bssid TEXT NOT NULL,
+                    ssid TEXT, channel INTEGER NOT NULL, frequency INTEGER,
+                    band TEXT NOT NULL, security TEXT, signal INTEGER,
+                    last_seen TEXT, selected_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS network_notes (
+                    bssid TEXT PRIMARY KEY, ssid TEXT, bookmarked INTEGER NOT NULL DEFAULT 0,
+                    note TEXT NOT NULL DEFAULT '', label TEXT, updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS network_monitor (
+                    id INTEGER PRIMARY KEY CHECK(id = 1), bssid TEXT NOT NULL,
+                    ssid TEXT, started_at TEXT NOT NULL, status TEXT NOT NULL,
+                    snapshot_json TEXT NOT NULL DEFAULT '{}',
+                    changes_json TEXT NOT NULL DEFAULT '[]',
+                    observation_count INTEGER NOT NULL DEFAULT 0,
+                    last_observed_at TEXT
                 );
                 CREATE TABLE IF NOT EXISTS events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT NOT NULL,
@@ -78,13 +102,40 @@ class Database:
                 );
                 CREATE INDEX IF NOT EXISTS idx_events_timestamp ON events(timestamp DESC);
                 CREATE INDEX IF NOT EXISTS idx_events_component ON events(component);
+                CREATE INDEX IF NOT EXISTS idx_access_points_bssid ON access_points(bssid);
+                CREATE INDEX IF NOT EXISTS idx_access_points_ssid ON access_points(ssid);
+                CREATE INDEX IF NOT EXISTS idx_recon_clients_bssid ON recon_clients(bssid);
                 """
             )
+            self._ensure_columns(db, "ap_sessions", {
+                "requested_band": "TEXT",
+                "resolved_band": "TEXT",
+                "requested_channel": "TEXT",
+                "resolved_channel": "INTEGER",
+                "channel_score": "REAL",
+                "recommendation_reason": "TEXT",
+            })
+            self._ensure_columns(db, "captures", {
+                "capture_mode": "TEXT NOT NULL DEFAULT 'raw'",
+                "target_bssid": "TEXT",
+                "target_ssid": "TEXT",
+                "target_frequency": "INTEGER",
+                "target_band": "TEXT",
+                "target_security": "TEXT",
+                "target_last_seen": "TEXT",
+            })
             row = db.execute("SELECT version FROM schema_meta LIMIT 1").fetchone()
             if row is None:
                 db.execute("INSERT INTO schema_meta(version) VALUES (?)", (SCHEMA_VERSION,))
             elif row["version"] < SCHEMA_VERSION:
                 db.execute("UPDATE schema_meta SET version = ?", (SCHEMA_VERSION,))
+
+    @staticmethod
+    def _ensure_columns(db: sqlite3.Connection, table: str, columns: dict[str, str]) -> None:
+        existing = {row["name"] for row in db.execute(f"PRAGMA table_info({table})")}
+        for name, declaration in columns.items():
+            if name not in existing:
+                db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
 
     def execute(self, sql: str, params: tuple = ()) -> None:
         with self._lock, self.connection() as db:

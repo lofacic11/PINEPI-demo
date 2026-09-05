@@ -527,6 +527,24 @@ def test_frequency_parser_handles_integer_decimal_6ghz_spacing_and_restrictions(
     ]
 
 
+def test_frequency_parser_keeps_band_specific_channels_so_6ghz_is_not_exposed_as_24ghz():
+    result = parse_iw_ap_channels(
+        """
+        * 2412.0 MHz [1] (20.0 dBm)
+        * 5180 MHz [36] (20.0 dBm)
+        * 5955.0 MHz [1] (20.0 dBm)
+        * 5975.0 MHz [5] (20.0 dBm)
+        """
+    )
+
+    assert result["ap_channels_by_band"] == {
+        "2.4": [1],
+        "5": [36],
+        "6": [1, 5],
+    }
+    assert result["ap_channels"] == [1, 5, 36]
+
+
 def test_ap_mode_and_channel_detection_states_are_independent(tmp_path):
     outputs = [
         "Supported interface modes:\n * managed\n * AP\n * monitor\n * 2412.0 MHz channel 1 (20.0 dBm)\n",

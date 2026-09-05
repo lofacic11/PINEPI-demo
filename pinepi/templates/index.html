@@ -28,7 +28,13 @@
         <button class="btn menu-btn" id="menuBtn" aria-label="Open navigation">☰</button>
         <div class="status"><span class="dot" id="systemDot"></span><span id="systemStatus">Connecting…</span></div>
       </div>
-      <div class="kpi-row"><span class="inline-stat">Management: <strong>wlan0</strong></span><span class="pill">PinePi</span></div>
+      <div class="kpi-row">
+        <div class="current-target-indicator hidden" id="currentTargetIndicator">
+          <div><small>Current Target</small><strong id="currentTargetName">—</strong><span id="currentTargetMeta"></span></div>
+          <button class="target-clear" id="clearTarget" type="button" aria-label="Clear current target">Clear</button>
+        </div>
+        <span class="inline-stat">Management: <strong>wlan0</strong></span><span class="pill">PinePi</span>
+      </div>
     </header>
 
     <div class="content">
@@ -72,6 +78,7 @@
             <div class="field"><label>&nbsp;</label><button class="btn primary full" id="reconBtn">Start Recon</button></div>
           </div>
           <div class="notice" id="reconNotice">Loading Recon state…</div>
+          <div class="notice notice-gap hidden" id="monitorNotice"></div>
         </div>
         <div class="grid grid-2 block-gap">
           <div class="card"><h3>Channel Usage</h3><div id="channelChart" class="empty">No Recon data.</div></div>
@@ -91,10 +98,13 @@
             <div class="field"><label for="apInterface">AP Interface</label><select id="apInterface"></select></div>
             <div class="subtitle capability-hint" id="apCapabilityHint"></div>
             <div class="field field-gap"><label for="apSsid">SSID</label><input id="apSsid" value="PinePi-Test" maxlength="32"></div>
-            <div class="grid grid-2 field-gap">
-              <div class="field"><label for="apChannel">Channel</label><select id="apChannel"><option>1</option><option selected>6</option><option>11</option><option>36</option><option>40</option><option>44</option><option>48</option></select></div>
-              <div class="field"><label for="apSecurity">Security</label><select id="apSecurity"><option value="open">Open</option><option value="wpa2">WPA2-PSK</option></select></div>
+            <div class="grid grid-3 field-gap">
+              <div class="field"><label for="apBand">Band</label><select id="apBand"><option value="auto">Auto</option></select></div>
+              <div class="field"><label for="apChannelMode">Channel</label><select id="apChannelMode"><option value="auto">Auto / Recommended</option><option value="manual">Manual</option></select></div>
+              <div class="field hidden" id="apManualChannelField"><label for="apChannel">Manual Channel</label><select id="apChannel"></select></div>
             </div>
+            <div class="notice notice-gap" id="apRecommendation">Select an AP adapter to calculate a recommendation.</div>
+            <div class="field field-gap"><label for="apSecurity">Security</label><select id="apSecurity"><option value="open">Open</option><option value="wpa2">WPA2-PSK</option></select></div>
             <div class="field field-gap hidden" id="apPasswordField"><label for="apPassword">Wi-Fi Password</label><div class="input-action"><input id="apPassword" type="text" minlength="8" maxlength="63" autocomplete="off" placeholder="8–63 characters"><button class="btn" id="copyApPassword" type="button">Copy</button></div><div class="subtitle" id="copyStatus"></div></div>
           </div>
           <div class="card"><h3>Routing</h3>
@@ -116,13 +126,24 @@
       </section>
 
       <section class="page" id="capture">
-        <div class="page-title"><div><h1>Capture</h1><div class="subtitle">Manual wireless packet capture and export</div></div></div>
-        <div class="card"><div class="controls">
-          <div class="field"><label for="captureInterface">Interface</label><select id="captureInterface"></select></div>
-          <div class="field"><label for="captureChannel">Channel</label><select id="captureChannel"><option>1</option><option selected>6</option><option>11</option><option>36</option><option>40</option><option>44</option><option>48</option></select></div>
-          <div class="field"><label for="captureName">Capture Name</label><input id="captureName" value="audit_capture" maxlength="64"></div>
-          <div class="field"><label>&nbsp;</label><button class="btn primary full" id="captureBtn">Start Capture</button></div>
-        </div><div class="notice" id="captureNotice">Loading capture state…</div></div>
+        <div class="page-title"><div><h1>Capture</h1><div class="subtitle">Target-associated or raw wireless packet capture and export</div></div></div>
+        <div class="card">
+          <div class="field capture-mode-field"><label for="captureMode">Capture Mode</label><select id="captureMode"><option value="targeted">Targeted Capture</option><option value="raw">Raw Capture</option></select></div>
+          <div class="target-capture-panel field-gap" id="captureTargetPanel">
+            <div class="section-title">Current Target</div>
+            <div class="network-meta" id="captureTargetDetails"></div>
+            <div class="subtitle">The adapter receives all frames it can hear on this channel. Targeted mode associates analysis and exports with this BSSID; it is not a hardware frame filter.</div>
+            <button class="btn field-gap" id="changeCaptureTarget" type="button">Choose in Recon</button>
+          </div>
+          <div class="field field-gap hidden" id="rawCaptureChannelField"><label for="captureChannel">Raw Capture Channel</label><select id="captureChannel"><option>1</option><option selected>6</option><option>11</option><option>36</option><option>40</option><option>44</option><option>48</option></select><div class="subtitle">Raw mode captures all visible 802.11 traffic on the selected channel.</div></div>
+          <div class="controls capture-controls field-gap">
+            <div class="field"><label for="captureInterface">Monitor Interface</label><select id="captureInterface"></select></div>
+            <div class="field"><label for="captureName">Capture Name</label><input id="captureName" value="audit_capture" maxlength="64"></div>
+            <div class="field"><label>Stop Behavior</label><input value="Manual stop" disabled></div>
+            <div class="field"><label>&nbsp;</label><button class="btn primary full" id="captureBtn">Start Capture</button></div>
+          </div>
+          <div class="notice" id="captureNotice">Loading capture state…</div>
+        </div>
         <div class="section-title">Capture History</div><div class="table-wrap"><table><thead><tr><th>Name</th><th>Date</th><th>Duration</th><th>Packets</th><th>Size</th><th>Status</th><th>Actions</th></tr></thead><tbody id="captureHistory"></tbody></table></div><div class="mobile-cards" id="captureCards"></div>
       </section>
 
@@ -130,7 +151,7 @@
         <div class="page-title"><div><h1>Logs</h1><div class="subtitle">System and operation history</div></div><div class="actions"><a class="btn log-export" data-format="txt">TXT</a><a class="btn log-export" data-format="csv">CSV</a><a class="btn log-export" data-format="json">JSON</a></div></div>
         <div class="card"><div class="controls">
           <div class="field"><label for="logLevel">Level</label><select id="logLevel"><option value="">All</option><option>INFO</option><option>WARNING</option><option>ERROR</option></select></div>
-          <div class="field"><label for="logComponent">Component</label><select id="logComponent"><option value="">All</option><option value="system">System</option><option value="recon">Recon</option><option value="access_point">Access Point</option><option value="capture">Capture</option><option value="networking">Networking</option><option value="storage">Storage</option></select></div>
+          <div class="field"><label for="logComponent">Component</label><select id="logComponent"><option value="">All</option><option value="system">System</option><option value="recon">Recon</option><option value="target">Target</option><option value="monitor">Monitor</option><option value="access_point">Access Point</option><option value="capture">Capture</option><option value="networking">Networking</option><option value="storage">Storage</option></select></div>
           <div class="field"><label for="logSearch">Search</label><input id="logSearch" placeholder="Search logs…"></div>
           <div class="field"><label>&nbsp;</label><button class="btn full" id="logApply">Apply</button></div>
         </div></div>

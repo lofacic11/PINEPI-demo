@@ -38,6 +38,7 @@ def parse_iw_ap_channels(output: str) -> dict:
     raw_frequency_count = 0
     parsed_channel_count = 0
     usable_channels: list[int] = []
+    usable_frequencies: list[tuple[float, int]] = []
     restricted_channels: list[int] = []
     restriction_counts = {"disabled": 0, "no_ir": 0, "passive_scan": 0, "radar": 0}
     errors: list[str] = []
@@ -54,6 +55,7 @@ def parse_iw_ap_channels(output: str) -> dict:
 
         parsed_channel_count += 1
         channel = int(match.group("channel"))
+        frequency = float(match.group("frequency"))
         details = re.sub(r"[-_]", " ", match.group("details").lower())
         # The kernel has already applied the active regulatory domain to these
         # per-frequency flags. Avoid a second, brittle country/channel table here.
@@ -70,6 +72,7 @@ def parse_iw_ap_channels(output: str) -> dict:
             restricted_channels.append(channel)
         else:
             usable_channels.append(channel)
+            usable_frequencies.append((frequency, channel))
 
     channels = sorted(set(usable_channels))
     if channels:
@@ -88,8 +91,24 @@ def parse_iw_ap_channels(output: str) -> dict:
         state = "unknown"
         reason = "No frequency/channel entries were found in iw PHY output."
 
+    channels_by_band = {"2.4": [], "5": [], "6": []}
+    for frequency, channel in usable_frequencies:
+        if 2400 <= frequency < 2500:
+            channels_by_band["2.4"].append(channel)
+        elif 4900 <= frequency < 5925:
+            channels_by_band["5"].append(channel)
+        elif 5925 <= frequency < 7125:
+            channels_by_band["6"].append(channel)
+    channels_by_band = {
+        band: sorted(set(values)) for band, values in channels_by_band.items()
+    }
     return {
         "ap_channels": channels,
+        "ap_channels_by_band": channels_by_band,
+        "ap_channel_frequencies": [
+            {"frequency_mhz": frequency, "channel": channel}
+            for frequency, channel in usable_frequencies
+        ],
         "ap_channel_state": state,
         "channel_reason": reason,
         "raw_frequency_count": raw_frequency_count,
