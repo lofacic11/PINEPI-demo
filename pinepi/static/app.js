@@ -154,7 +154,7 @@ async function updateApConfiguration(forceBand = null, forceChannel = null, forc
     "2.4": reportedBands ? [...new Set(reportedBands["2.4"] || [])].sort((a, b) => a - b) : channels.filter((channel) => channel >= 1 && channel <= 14),
     "5": reportedBands ? [...new Set(reportedBands["5"] || [])].sort((a, b) => a - b) : channels.filter((channel) => channel >= 32 && channel <= 177),
   };
-  const bandSelect = $("#apBand"), previousBand = forceBand ?? bandSelect.value || "auto"; clear(bandSelect);
+  const bandSelect = $("#apBand"), previousBand = (forceBand ?? bandSelect.value) || "auto"; clear(bandSelect);
   bandSelect.append(option("auto", "Auto"));
   if (groups["2.4"].length) bandSelect.append(option("2.4", "2.4 GHz"));
   if (groups["5"].length) bandSelect.append(option("5", "5 GHz"));
