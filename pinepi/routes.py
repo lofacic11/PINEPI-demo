@@ -176,6 +176,11 @@ def captures():
     return success({"status": ops.capture_status(), "history": ops.capture_history()})
 
 
+@api.post("/captures/<capture_id>/reconnect")
+def capture_reconnect(capture_id: str):
+    return success(services()["operations"].request_capture_reconnect(capture_id, body()))
+
+
 @api.delete("/captures/<capture_id>")
 def capture_delete(capture_id: str):
     services()["operations"].delete_capture(capture_id)

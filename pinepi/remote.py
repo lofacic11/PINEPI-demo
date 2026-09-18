@@ -79,8 +79,24 @@ class RemotePrivilegedService:
         data = self._rpc("start_recon", interface=interface, prefix=str(prefix), operation_id=operation_id)
         return RemoteProcess(self, data["operation_id"], data["pid"])
 
-    def start_capture(self, interface: str, path: Path, max_bytes: int, operation_id: str) -> RemoteProcess:
-        data = self._rpc("start_capture", interface=interface, path=str(path), max_bytes=max_bytes, operation_id=operation_id)
+    def start_capture(
+        self,
+        interface: str,
+        path: Path,
+        max_bytes: int,
+        operation_id: str,
+        channel: int,
+        target_bssid: str | None = None,
+    ) -> RemoteProcess:
+        data = self._rpc(
+            "start_capture",
+            interface=interface,
+            path=str(path),
+            max_bytes=max_bytes,
+            operation_id=operation_id,
+            channel=channel,
+            target_bssid=target_bssid,
+        )
         return RemoteProcess(self, data["operation_id"], data["pid"])
 
     def start_ap(
@@ -123,6 +139,37 @@ class RemotePrivilegedService:
             operation_id=operation_id,
             mac=mac,
             client_action=action,
+        )
+
+    def capture_handshake_frames(
+        self, path: Path, operation_id: str, target_bssid: str,
+    ) -> list[dict]:
+        return self._rpc(
+            "capture_handshake_frames",
+            path=str(path),
+            operation_id=operation_id,
+            target_bssid=target_bssid,
+        )
+
+    def capture_reconnect(
+        self,
+        interface: str,
+        operation_id: str,
+        bssid: str,
+        channel: int,
+        client_mac: str,
+        count: int,
+        duration_seconds: int,
+    ) -> dict:
+        return self._rpc(
+            "capture_reconnect",
+            interface=interface,
+            operation_id=operation_id,
+            bssid=bssid,
+            channel=channel,
+            client_mac=client_mac,
+            count=count,
+            duration_seconds=duration_seconds,
         )
 
     def inspect_capture(self, path: Path) -> CommandResult:

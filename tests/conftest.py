@@ -29,7 +29,9 @@ class FakePrivileged:
         self.fail_ap = False
         self.fail_routing = False
         self.fail_client_action = False
+        self.fail_reconnect = False
         self.stations = []
+        self.handshake_frames = []
 
     def reconcile_runtime(self):
         self.calls.append(("reconcile",))
@@ -44,8 +46,8 @@ class FakePrivileged:
     def start_recon(self, interface, prefix, operation_id):
         self.calls.append(("start_recon", interface))
         return FakeProcess(operation_id, not self.fail_capture)
-    def start_capture(self, interface, path, max_bytes, operation_id):
-        self.calls.append(("start_capture", interface, path))
+    def start_capture(self, interface, path, max_bytes, operation_id, channel=None, target_bssid=None):
+        self.calls.append(("start_capture", interface, path, channel, target_bssid))
         process = FakeProcess(operation_id, not self.fail_capture)
         if not self.fail_capture:
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -80,6 +82,18 @@ class FakePrivileged:
         if self.fail_client_action:
             raise PinePiError("HELPER_UNAVAILABLE", "Privileged helper unavailable.", 503)
         return {"interface": interface, "mac": mac, "action": action, "result": "OK"}
+    def capture_handshake_frames(self, path, operation_id, target_bssid):
+        self.calls.append(("capture_handshake_frames", operation_id, target_bssid))
+        return [dict(item) for item in self.handshake_frames]
+    def capture_reconnect(self, interface, operation_id, bssid, channel, client_mac, count, duration_seconds):
+        self.calls.append(("capture_reconnect", interface, operation_id, bssid, channel, client_mac, count, duration_seconds))
+        if self.fail_reconnect:
+            raise PinePiError("DEAUTH_FAILED", "bounded reconnect failed", 500)
+        return {
+            "interface": interface, "operation_id": operation_id, "bssid": bssid,
+            "client_mac": client_mac, "count": count, "duration_seconds": duration_seconds,
+            "bounded": True,
+        }
     def inspect_capture(self, _path):
         class Result:
             returncode = 1

@@ -32,6 +32,8 @@ AP_DHCP_END = "10.77.0.200"
 AP_NETMASK = "255.255.255.0"
 AP_NETWORK = ipaddress.ip_network(AP_SUBNET)
 CLIENT_MAC_PATTERN = re.compile(r"^(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$")
+DEAUTH_MAX_COUNT = 3
+DEAUTH_MAX_DURATION_SECONDS = 15
 
 
 def normalize_client_mac(value: str) -> str:
@@ -43,6 +45,17 @@ def normalize_client_mac(value: str) -> str:
     if not valid:
         raise PinePiError("INVALID_CLIENT_MAC", "Client MAC must be a valid unicast MAC address.")
     return mac
+
+
+def normalize_bssid(value: str) -> str:
+    """Validate an infrastructure BSSID before using it in capture tooling."""
+
+    bssid = str(value or "").upper()
+    valid = CLIENT_MAC_PATTERN.fullmatch(bssid) and bssid != "00:00:00:00:00:00"
+    valid = bool(valid and not (int(bssid[:2], 16) & 1))
+    if not valid:
+        raise PinePiError("INVALID_BSSID", "BSSID must be a valid unicast MAC address.")
+    return bssid
 
 
 def parse_iw_ap_channels(output: str) -> dict:
@@ -631,13 +644,129 @@ class PrivilegedService:
             operation_id,
         )
 
-    def start_capture(self, interface: str, path: Path, max_bytes: int, operation_id: str) -> OwnedProcess:
+    def start_capture(
+        self,
+        interface: str,
+        path: Path,
+        max_bytes: int,
+        operation_id: str,
+        channel: int | None = None,
+        target_bssid: str | None = None,
+    ) -> OwnedProcess:
         interface = self._interface(interface)
+        if channel is not None and (isinstance(channel, bool) or not isinstance(channel, int) or not 1 <= channel <= 196):
+            raise PinePiError("INVALID_CHANNEL", "Channel is out of range.")
+        if target_bssid is not None:
+            normalize_bssid(target_bssid)
         max_kb = max(1, max_bytes // 1000)
         return self.spawn(
             ["dumpcap", "-q", "-i", interface, "-w", str(path), "-a", f"filesize:{max_kb}"],
             operation_id,
         )
+
+    def capture_handshake_frames(self, path: Path, operation_id: str, target_bssid: str) -> list[dict]:
+        """Read bounded EAPOL-Key metadata from a capture without exposing packet payloads."""
+
+        if not re.fullmatch(r"[a-f0-9]{32}", str(operation_id or "")):
+            raise PinePiError("INVALID_OPERATION_ID", "Invalid capture operation identifier.")
+        target_bssid = normalize_bssid(target_bssid)
+        result = self.run(
+            [
+                "tshark", "-n", "-r", str(path), "-Y", "eapol.type == 3",
+                "-T", "fields", "-E", "separator=/t", "-E", "occurrence=f",
+                "-e", "wlan.bssid", "-e", "wlan.sa", "-e", "wlan.da",
+                "-e", "wlan_rsna_eapol.keydes.msgnr",
+                "-e", "eapol.keydes.replay_counter",
+                "-e", "wlan_rsna_eapol.keydes.key_info",
+            ],
+            check=False,
+            timeout=10,
+        )
+        stderr = result.stderr.lower()
+        truncated = any(marker in stderr for marker in ("cut short", "truncated", "middle of a packet"))
+        if result.returncode != 0 and not truncated:
+            raise PinePiError(
+                "HANDSHAKE_ANALYSIS_FAILED",
+                "Unable to inspect the capture for WPA/WPA2 handshake traffic.",
+                500,
+                {
+                    "stage": "handshake_analysis",
+                    "exit_code": result.returncode,
+                    "stderr": self._bounded_text(result.stderr, 1024),
+                },
+            )
+        frames = []
+        for line in result.stdout.splitlines()[:4096]:
+            fields = line.split("\t")
+            if len(fields) != 6:
+                continue
+            bssid, source, destination, message_number, replay_counter, key_info = (
+                field.strip() for field in fields
+            )
+            frames.append({
+                "bssid": bssid,
+                "source": source,
+                "destination": destination,
+                "message_number": message_number,
+                "replay_counter": replay_counter,
+                "key_info": key_info,
+            })
+        return frames
+
+    def capture_reconnect(
+        self,
+        interface: str,
+        operation_id: str,
+        bssid: str,
+        channel: int,
+        client_mac: str,
+        count: int,
+        duration_seconds: int,
+    ) -> dict:
+        """Send one tightly bounded, client-specific reconnect request burst."""
+
+        interface = self._interface(interface)
+        if not re.fullmatch(r"[a-f0-9]{32}", str(operation_id or "")):
+            raise PinePiError("INVALID_OPERATION_ID", "Invalid capture operation identifier.")
+        bssid = normalize_bssid(bssid)
+        client_mac = normalize_client_mac(client_mac)
+        if client_mac == bssid:
+            raise PinePiError("INVALID_CLIENT_MAC", "The selected client must not be the target access point.")
+        if isinstance(channel, bool) or not isinstance(channel, int) or not 1 <= channel <= 196:
+            raise PinePiError("INVALID_CHANNEL", "Channel is out of range.")
+        if isinstance(count, bool) or not isinstance(count, int) or not 1 <= count <= DEAUTH_MAX_COUNT:
+            raise PinePiError(
+                "DEAUTH_LIMIT_EXCEEDED",
+                f"Reconnect count must be between 1 and {DEAUTH_MAX_COUNT}.",
+            )
+        if (
+            isinstance(duration_seconds, bool)
+            or not isinstance(duration_seconds, int)
+            or not 1 <= duration_seconds <= DEAUTH_MAX_DURATION_SECONDS
+        ):
+            raise PinePiError(
+                "DEAUTH_LIMIT_EXCEEDED",
+                f"Reconnect duration must be between 1 and {DEAUTH_MAX_DURATION_SECONDS} seconds.",
+            )
+        self.run(
+            [
+                "aireplay-ng", "--deauth", str(count), "-a", bssid,
+                "-c", client_mac, interface,
+            ],
+            timeout=duration_seconds,
+            error_code="DEAUTH_FAILED",
+            error_message="The bounded client reconnect request failed.",
+            stage="capture_reconnect",
+        )
+        return {
+            "interface": interface,
+            "operation_id": operation_id,
+            "bssid": bssid,
+            "client_mac": client_mac,
+            "count": count,
+            "duration_seconds": duration_seconds,
+            "bounded": True,
+        }
 
     def start_ap(
         self, interface: str, ssid: str, channel: int, security: str, password: str | None,

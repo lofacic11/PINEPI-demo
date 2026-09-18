@@ -68,20 +68,43 @@ def test_recon_action_hub_and_target_indicator_have_mobile_contract():
     assert "current-target-indicator" in styles
 
 
-def test_targeted_and_raw_capture_modes_preserve_truthful_capture_semantics():
+def test_handshake_and_raw_capture_modes_preserve_truthful_capture_semantics():
     root = Path(__file__).parents[1]
     template = (root / "pinepi" / "templates" / "index.html").read_text(encoding="utf-8")
     script = (root / "pinepi" / "static" / "app.js").read_text(encoding="utf-8")
+    styles = (root / "pinepi" / "static" / "app.css").read_text(encoding="utf-8")
 
     assert 'id="captureMode"' in template
-    assert "Targeted Capture" in template
+    assert "WPA/WPA2 Handshake" in template
     assert "Raw Capture" in template
-    assert "receives all frames it can hear on this channel" in template
-    assert "not a hardware frame filter" in template
+    assert 'id="handshakePanel"' in template
+    assert 'id="captureReconnectBtn"' in template
+    assert 'id="captureClient"' in template
+    assert 'id="activeCaptureDownload"' in template
+    assert "Only use this on networks and devices you are authorized to test" in template
     assert "Raw mode captures all visible 802.11 traffic" in template
     assert 'gotoPage("capture")' in script
-    assert 'target: mode === "targeted"' in script
+    assert 'target: mode !== "raw"' in script
+    assert "handshakeLabel" in script
+    assert 'not_captured: "Not captured"' in script
+    assert 'partial: "Partial"' in script
+    assert 'full: "Full capture"' in script
+    assert 'value === "partial" ? "warn" : "red"' in script
+    assert "/reconnect" in script
+    assert "window.confirm" in script
+    assert "state-not_captured" in styles
+    assert "state-partial" in styles
+    assert "state-full" in styles
     assert "No free compatible monitor-capable adapter." in script
+
+
+def test_deauthentication_has_no_standalone_navigation_or_page():
+    root = Path(__file__).parents[1]
+    template = (root / "pinepi" / "templates" / "index.html").read_text(encoding="utf-8")
+
+    assert 'id="deauth"' not in template
+    assert 'data-page="deauth"' not in template
+    assert "Deauthentication temporarily disconnects" in template
 
 
 def test_ap_clients_use_client_oriented_metrics_and_owned_ap_actions():

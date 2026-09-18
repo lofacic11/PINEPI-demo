@@ -132,11 +132,11 @@
       <section class="page" id="capture">
         <div class="page-title"><div><h1>Capture</h1><div class="subtitle">Target-associated or raw wireless packet capture and export</div></div></div>
         <div class="card">
-          <div class="field capture-mode-field"><label for="captureMode">Capture Mode</label><select id="captureMode"><option value="targeted">Targeted Capture</option><option value="raw">Raw Capture</option></select></div>
+          <div class="field capture-mode-field"><label for="captureMode">Capture Mode</label><select id="captureMode"><option value="handshake">WPA/WPA2 Handshake</option><option value="raw">Raw Capture</option></select></div>
           <div class="target-capture-panel field-gap" id="captureTargetPanel">
             <div class="section-title">Current Target</div>
             <div class="network-meta" id="captureTargetDetails"></div>
-            <div class="subtitle">The adapter receives all frames it can hear on this channel. Targeted mode associates analysis and exports with this BSSID; it is not a hardware frame filter.</div>
+            <div class="subtitle" id="captureTargetHelp">Handshake mode listens on the target channel and associates EAPOL analysis with this BSSID.</div>
             <button class="btn field-gap" id="changeCaptureTarget" type="button">Choose in Recon</button>
           </div>
           <div class="field field-gap hidden" id="rawCaptureChannelField"><label for="captureChannel">Raw Capture Channel</label><select id="captureChannel"><option>1</option><option selected>6</option><option>11</option><option>36</option><option>40</option><option>44</option><option>48</option></select><div class="subtitle">Raw mode captures all visible 802.11 traffic on the selected channel.</div></div>
@@ -147,8 +147,15 @@
             <div class="field"><label>&nbsp;</label><button class="btn primary full" id="captureBtn">Start Capture</button></div>
           </div>
           <div class="notice" id="captureNotice">Loading capture state…</div>
+          <div class="handshake-panel hidden" id="handshakePanel">
+            <div class="handshake-heading"><div><strong>Handshake</strong><div class="subtitle">Live WPA/WPA2 EAPOL analysis for the selected target</div></div><span class="pill red" id="handshakeBadge">Not captured</span></div>
+            <div class="field field-gap"><label for="captureClient">Observed Client</label><select id="captureClient"><option value="">No client observed</option></select><div class="subtitle" id="captureClientHint">Capture continues passively when no client is selected.</div></div>
+            <div class="notice warning notice-gap">Deauthentication temporarily disconnects the selected Wi-Fi client. Only use this on networks and devices you are authorized to test.</div>
+            <div class="actions field-gap"><button class="btn danger" id="captureReconnectBtn" type="button" disabled>Force Reconnect</button><a class="btn" id="activeCaptureDownload" href="#">Download Capture</a></div>
+            <div class="notice notice-gap hidden" id="captureReconnectNotice"></div>
+          </div>
         </div>
-        <div class="section-title">Capture History</div><div class="table-wrap"><table><thead><tr><th>Name</th><th>Date</th><th>Duration</th><th>Packets</th><th>Size</th><th>Status</th><th>Actions</th></tr></thead><tbody id="captureHistory"></tbody></table></div><div class="mobile-cards" id="captureCards"></div>
+        <div class="section-title">Capture History</div><div class="table-wrap"><table><thead><tr><th>Name</th><th>Date</th><th>Duration</th><th>Packets</th><th>Size</th><th>Status</th><th>Handshake</th><th>Actions</th></tr></thead><tbody id="captureHistory"></tbody></table></div><div class="mobile-cards" id="captureCards"></div>
       </section>
 
       <section class="page" id="logs">

@@ -7,7 +7,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 class Database:
@@ -85,7 +85,11 @@ class Database:
                     size_bytes INTEGER NOT NULL DEFAULT 0, stop_reason TEXT,
                     capture_mode TEXT NOT NULL DEFAULT 'raw', target_bssid TEXT,
                     target_ssid TEXT, target_frequency INTEGER, target_band TEXT,
-                    target_security TEXT, target_last_seen TEXT
+                    target_security TEXT, target_last_seen TEXT,
+                    handshake_state TEXT, handshake_client_mac TEXT,
+                    handshake_updated_at TEXT,
+                    reconnect_count INTEGER NOT NULL DEFAULT 0,
+                    last_reconnect_at TEXT, last_reconnect_client TEXT
                 );
                 CREATE TABLE IF NOT EXISTS current_target (
                     id INTEGER PRIMARY KEY CHECK(id = 1), bssid TEXT NOT NULL,
@@ -133,6 +137,12 @@ class Database:
                 "target_band": "TEXT",
                 "target_security": "TEXT",
                 "target_last_seen": "TEXT",
+                "handshake_state": "TEXT",
+                "handshake_client_mac": "TEXT",
+                "handshake_updated_at": "TEXT",
+                "reconnect_count": "INTEGER NOT NULL DEFAULT 0",
+                "last_reconnect_at": "TEXT",
+                "last_reconnect_client": "TEXT",
             })
             row = db.execute("SELECT version FROM schema_meta LIMIT 1").fetchone()
             previous_version = int(row["version"]) if row is not None else 0

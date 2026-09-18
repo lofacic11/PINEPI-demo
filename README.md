@@ -1,8 +1,8 @@
 # PinePi Prototype v1
 
-PinePi is a Raspberry Pi wireless-auditing appliance for controlled, authorized cybersecurity education. Prototype v1 provides a responsive web interface for passive Recon, a controlled test Access Point, standalone packet capture, session exports, and operational logs.
+PinePi is a Raspberry Pi wireless-auditing appliance for controlled, authorized cybersecurity education. Prototype v1 provides a responsive web interface for passive Recon, a controlled test Access Point, raw and WPA/WPA2 handshake capture, session exports, and operational logs.
 
-It is not an active-attack platform. It does not include credential collection, phishing, automated evil-twin behavior, or deauthentication of third-party networks. The only client-disconnect control is an administrative action against a station currently associated with PinePi's own hosted test AP.
+It is not a password-attack platform. It does not include credential collection, phishing, automated evil-twin behavior, password cracking, brute force, or persistent client disruption. The only external-network deauthentication control is a single, bounded, client-specific reconnect request inside an already-running handshake capture, for networks and devices the operator is authorized to test. Administrative Kick/Block/Unblock controls remain limited to stations on PinePi's own hosted test AP.
 
 ## Hardware and network model
 
@@ -17,7 +17,7 @@ The management WLAN intentionally remains open for Prototype v1. Use PinePi only
 - Dashboard: live CPU, memory, filesystem, temperature, uptime, real interfaces, active operations, and the latest stored wireless landscape.
 - Recon: monitor-capable interface selection, live status, parsed airodump-ng AP/client observations, channel/security charts, searching, sorting, detail/association view, history, CSV, and JSON.
 - Access Point: AP-capable adapter selection, Open or WPA2-PSK, readable/copyable live passphrase, verified hostapd state, dnsmasq DHCP, automatic or explicit connected uplink, isolated nftables NAT state, per-client metadata and traffic tracking, Kick/Block/Unblock administration for the owned AP, optional AP-interface traffic capture, history, and ZIP export.
-- Capture: channel/name selection, bounded dumpcap PCAPNG capture, status/history, PCAP download, safe JSON analysis, and deletion.
+- Capture: Recon-targeted WPA/WPA2 handshake capture or raw channel capture, live three-state handshake analysis, observed-client selection, an optional bounded reconnect request, status/history, PCAP download, safe JSON analysis, and deletion.
 - Logs: structured, bounded event history with level/component/search filters and TXT/CSV/JSON exports.
 - Mobile UI: hamburger navigation and card-based alternatives for wide tables.
 - Storage safety: 250 MB default capture ceiling, minimum-free-space guard before and during capture, bounded application logs, streaming file downloads, and conservative PCAP inspection.
@@ -33,11 +33,25 @@ PinePi reads per-station counters from `iw dev <interface> station dump`. Linux 
 
 Totals are maintained independently per MAC and AP session. They accumulate deltas while an association is stable and preserve earlier bytes when a station reconnects and its kernel counters reset. A new AP session starts new totals. Starting or stopping packet capture does not alter station accounting; captures and station counters are independent observations and need not have identical byte totals.
 
-Database schema version 3 migrates legacy AP-side `rx_bytes` into `upload_bytes` and legacy AP-side `tx_bytes` into `download_bytes`. New API responses and exports intentionally use only the explicit names; legacy SQLite columns may remain in an upgraded database but are no longer exported.
+Database schema version 4 migrates legacy AP-side `rx_bytes` into `upload_bytes` and legacy AP-side `tx_bytes` into `download_bytes`, and adds handshake/reconnect metadata to existing capture rows without moving capture files into SQLite. New API responses and exports intentionally use only the explicit traffic names; legacy SQLite columns may remain in an upgraded database but are no longer exported.
 
 For an associated station, PinePi first correlates its MAC with a non-expired lease in that AP session's private dnsmasq lease file. If no valid lease exists, it may use a valid neighbor-table address on the same AP interface and `10.77.0.0/24` subnet. It never synthesizes an address, and a lease or neighbor entry alone is not treated as a connected station. IP and hostname can remain unavailable before DHCP completes, for static-IP clients, after an entry expires, or when neither source has a valid current mapping.
 
 Kick asks hostapd to deauthenticate the currently associated station once; it may reconnect normally. Block adds the station MAC to the runtime deny ACL of the active PinePi hostapd instance and disconnects it; Unblock removes that entry. Blocks last only for the active AP session. These commands are accepted only for the exact external interface, session directory, and live hostapd process owned by PinePi. They are never exposed for `wlan0`, arbitrary interfaces, or stations on third-party networks.
+
+### WPA/WPA2 handshake capture
+
+Handshake capture is part of the existing **Capture** page; there is no separate Handshake or Deauthentication menu. The intended workflow is:
+
+1. Run Recon, choose an authorized WPA/WPA2 AP, and set it as the current target.
+2. Open Capture, select a compatible free external adapter, and start **WPA/WPA2 Handshake** capture.
+3. Wait passively, or optionally select a recently observed client and explicitly confirm **Force Reconnect**.
+4. Watch the polled status progress through **Not captured** (red), **Partial** (orange), or **Full capture** (green).
+5. Stop the capture manually and download its PCAPNG file or JSON summary from Capture History.
+
+PinePi reserves the selected external adapter, enters monitor mode, tunes it to the target channel, and keeps `dumpcap` running while it inspects bounded EAPOL metadata with `tshark`. Analysis is scoped to the selected BSSID and client. Duplicate, retransmitted, out-of-order, malformed, unrelated, and truncated observations are handled conservatively; a full result requires a matching message pair from one client and replay exchange. The normal UI deliberately does not expose individual EAPOL message numbers or packet details.
+
+The reconnect helper is optional: passive capture remains available when no client is known. It is accepted only for the exact live handshake capture, target BSSID, channel, reserved external adapter, and a client recently associated with that target in Recon or observed in captured EAPOL traffic. Each click and confirmation issues one fixed-argument, client-specific `aireplay-ng` request, capped server-side at 3 deauthentication frames and 15 seconds. There is no broadcast target, automatic retry, continuous mode, flood mode, or standalone endpoint that can start deauthentication without a matching active capture. The capture stays alive afterward so it can observe the reconnect.
 
 ## Architecture
 

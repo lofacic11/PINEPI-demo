@@ -12,7 +12,14 @@ from pathlib import Path
 
 from .config import Config
 from .errors import PinePiError
-from .privileged import OwnedProcess, PrivilegedService, normalize_client_mac
+from .privileged import (
+    DEAUTH_MAX_COUNT,
+    DEAUTH_MAX_DURATION_SECONDS,
+    OwnedProcess,
+    PrivilegedService,
+    normalize_bssid,
+    normalize_client_mac,
+)
 
 OPERATION_ID = re.compile(r"^[a-f0-9]{32}(?:-(?:traffic|hostapd|dnsmasq))?$")
 
@@ -23,6 +30,7 @@ class HelperState:
         self.privileged = PrivilegedService(runtime_dir or self.data_dir / "runtime", Config.COMMAND_TIMEOUT)
         self.processes: dict[str, OwnedProcess] = {}
         self.access_points: dict[str, dict] = {}
+        self.captures: dict[str, dict] = {}
         self._dispatch_lock = threading.RLock()
 
     def operation_id(self, value) -> str:
@@ -122,11 +130,27 @@ class HelperState:
                 valid_path = path.parent == (self.data_dir / "captures").resolve() and path.name.startswith(operation_id + "_") and path.suffix == ".pcapng"
             if not valid_path:
                 raise PinePiError("INVALID_STORAGE_PATH", "Capture path does not match its operation.", 403)
+            channel = params.get("channel")
+            if isinstance(channel, bool) or not isinstance(channel, int) or not 1 <= channel <= 196:
+                raise PinePiError("INVALID_CHANNEL", "Channel is out of range.")
+            target_bssid = params.get("target_bssid")
+            if target_bssid is not None:
+                target_bssid = normalize_bssid(str(target_bssid))
             path.parent.mkdir(parents=True, exist_ok=True)
             path.touch(exist_ok=True)
             path.chmod(0o660)
-            process = service.start_capture(str(params.get("interface", "")), path, max_bytes, operation_id)
-            return self.remember(process)
+            interface = str(params.get("interface", ""))
+            process = service.start_capture(
+                interface, path, max_bytes, operation_id, channel, target_bssid,
+            )
+            result = self.remember(process)
+            self.captures[operation_id] = {
+                "interface": interface,
+                "path": str(path),
+                "channel": channel,
+                "target_bssid": target_bssid,
+            }
+            return result
         if action == "start_ap":
             operation_id = self.operation_id(params.get("operation_id"))
             session_dir = self.path(params.get("session_dir"), self.data_dir / "ap_sessions")
@@ -187,6 +211,64 @@ class HelperState:
             elif client_action == "unblock":
                 blocked_macs.discard(mac)
             return result
+        if action == "capture_handshake_frames":
+            operation_id = self.operation_id(params.get("operation_id"))
+            if "-" in operation_id:
+                raise PinePiError("INVALID_OPERATION_ID", "A standalone capture identifier is required.")
+            path = self.path(params.get("path"), self.data_dir / "captures")
+            valid_path = (
+                path.parent == (self.data_dir / "captures").resolve()
+                and path.name.startswith(operation_id + "_")
+                and path.suffix == ".pcapng"
+            )
+            if not valid_path:
+                raise PinePiError("INVALID_STORAGE_PATH", "Capture path does not match its operation.", 403)
+            return service.capture_handshake_frames(
+                path,
+                operation_id,
+                normalize_bssid(str(params.get("target_bssid", ""))),
+            )
+        if action == "capture_reconnect":
+            operation_id = self.operation_id(params.get("operation_id"))
+            if "-" in operation_id:
+                raise PinePiError("INVALID_OPERATION_ID", "A standalone capture identifier is required.")
+            record = self.captures.get(operation_id)
+            process = self.processes.get(operation_id)
+            interface = str(params.get("interface", ""))
+            bssid = normalize_bssid(str(params.get("bssid", "")))
+            channel = params.get("channel")
+            if (
+                not record
+                or not process
+                or not process.alive()
+                or record.get("interface") != interface
+                or record.get("target_bssid") != bssid
+                or record.get("channel") != channel
+            ):
+                raise PinePiError(
+                    "HANDSHAKE_CAPTURE_NOT_ACTIVE",
+                    "Reconnect requests require the matching active handshake capture.",
+                    409,
+                )
+            count = params.get("count")
+            duration_seconds = params.get("duration_seconds")
+            if isinstance(count, bool) or not isinstance(count, int) or not 1 <= count <= DEAUTH_MAX_COUNT:
+                raise PinePiError("DEAUTH_LIMIT_EXCEEDED", "Reconnect count exceeds the server limit.")
+            if (
+                isinstance(duration_seconds, bool)
+                or not isinstance(duration_seconds, int)
+                or not 1 <= duration_seconds <= DEAUTH_MAX_DURATION_SECONDS
+            ):
+                raise PinePiError("DEAUTH_LIMIT_EXCEEDED", "Reconnect duration exceeds the server limit.")
+            return service.capture_reconnect(
+                interface,
+                operation_id,
+                bssid,
+                channel,
+                normalize_client_mac(str(params.get("client_mac", ""))),
+                count,
+                duration_seconds,
+            )
         if action == "inspect_capture":
             path = self.path(params.get("path"), self.data_dir / "captures", self.data_dir / "ap_sessions")
             if path.suffix not in {".pcap", ".pcapng"}:
@@ -201,6 +283,7 @@ class HelperState:
             operation_id = self.operation_id(params.get("operation_id"))
             process = self.processes.pop(operation_id, None)
             service.stop_process(process, min(max(float(params.get("grace", 3)), 0), 10))
+            self.captures.pop(operation_id, None)
             if operation_id.endswith("-hostapd"):
                 self.access_points.pop(operation_id.removesuffix("-hostapd"), None)
             return {}
@@ -216,6 +299,7 @@ class HelperState:
                 service.stop_process(process)
             self.processes.clear()
             self.access_points.clear()
+            self.captures.clear()
             return service.reconcile_runtime()
         raise PinePiError("HELPER_ACTION_DENIED", "The requested helper action is not permitted.", 403)
 
@@ -225,6 +309,7 @@ class HelperState:
                 self.privileged.stop_process(process)
             self.processes.clear()
             self.access_points.clear()
+            self.captures.clear()
             self.privileged.reconcile_runtime()
 
 

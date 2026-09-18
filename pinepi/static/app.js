@@ -5,6 +5,7 @@ const $$ = (selector) => [...document.querySelectorAll(selector)];
 const state = {
   page: "dashboard", interfaces: [], recon: null, selectedNetworkKey: null, apError: null,
   currentTarget: null, apRecommendation: null, capturePrefill: false,
+  captureStatus: null, reconnectMessage: null,
   reconSort: {key: "signal", direction: -1}, pending: false, refreshing: false,
 };
 
@@ -36,6 +37,9 @@ function fmtDate(value) {
 }
 function percentBar(id, value) { $(id).style.width = `${Math.min(100, Math.max(0, Number(value) || 0))}%`; }
 function statusPill(label, tone = "") { return element("span", `pill ${tone}`.trim(), label); }
+function handshakeLabel(value) { return ({not_captured: "Not captured", partial: "Partial", full: "Full capture"})[value] || "Not captured"; }
+function handshakeTone(value) { return value === "full" ? "" : value === "partial" ? "warn" : "red"; }
+function handshakePill(value) { return statusPill(handshakeLabel(value), handshakeTone(value)); }
 function setNotice(node, message, tone = "") { node.textContent = message; node.className = `notice ${tone}`.trim(); }
 function showError(error) {
   const toast = $("#toast"); toast.textContent = error.message || "Request failed."; toast.classList.add("show");
@@ -364,8 +368,8 @@ function renderApClients(clients) {
     card.append(heading, metrics, actions); list.append(card);
   });
 }
-function mobileHistoryCard(title, badge, fields, actions = []) {
-  const card = element("div", "network-card"), head = element("div", "network-card-head"); head.append(element("strong", "", title), statusPill(badge, "blue")); const grid = element("div", "network-card-grid");
+function mobileHistoryCard(title, badge, fields, actions = [], tone = "blue") {
+  const card = element("div", "network-card"), head = element("div", "network-card-head"); head.append(element("strong", "", title), statusPill(badge, tone)); const grid = element("div", "network-card-grid");
   fields.forEach(([label, value]) => { const span = element("span", "", label); span.append(document.createElement("br"), element("strong", "", value)); grid.append(span); }); card.append(head, grid);
   if (actions.length) { const wrap = element("div", "actions field-gap"); actions.forEach((action) => wrap.append(action)); card.append(wrap); } return card;
 }
@@ -406,25 +410,26 @@ async function loadAp() {
 function actionLink(label, href) { const link = element("a", "btn", label); link.href = href; return link; }
 function renderCaptureHistory(history) {
   const tbody = $("#captureHistory"), cards = $("#captureCards"); clear(tbody); clear(cards);
-  if (!history.length) { const row = element("tr"), td = element("td", "empty", "No stored captures."); td.colSpan = 7; row.append(td); tbody.append(row); return empty(cards, "No stored captures."); }
+  if (!history.length) { const row = element("tr"), td = element("td", "empty", "No stored captures."); td.colSpan = 8; row.append(td); tbody.append(row); return empty(cards, "No stored captures."); }
   history.forEach((capture) => {
     const duration = capture.ended_at ? Math.max(0, Math.floor((new Date(capture.ended_at) - new Date(capture.started_at)) / 1000)) : 0;
     const actions = element("div", "actions"), pcap = actionLink("PCAP", `/api/captures/${encodeURIComponent(capture.id)}/download`), summary = actionLink("JSON", `/api/captures/${encodeURIComponent(capture.id)}/summary.json`), remove = element("button", "btn danger", "Delete");
     const deleteAction = async () => { if (!window.confirm(`Delete capture “${capture.name}”?`)) return; try { await api(`/captures/${encodeURIComponent(capture.id)}`, {method: "DELETE"}); await loadCapture(); } catch (error) { showError(error); } };
     remove.addEventListener("click", deleteAction); actions.append(pcap, summary, remove);
-    const historyName = capture.capture_mode === "targeted" ? `${capture.name} · ${capture.target_ssid || capture.target_bssid}` : capture.name;
-    const row = element("tr"); [historyName, fmtDate(capture.started_at), fmtDuration(duration), capture.packet_count ?? "—", fmtBytes(capture.size_bytes), capture.status].forEach((value) => row.append(element("td", "", value))); const td = element("td"); td.append(actions); row.append(td); tbody.append(row);
+    const targeted = ["targeted", "handshake"].includes(capture.capture_mode), historyName = targeted ? `${capture.name} · ${capture.target_ssid || capture.target_bssid}` : capture.name;
+    const row = element("tr"); [historyName, fmtDate(capture.started_at), fmtDuration(duration), capture.packet_count ?? "—", fmtBytes(capture.size_bytes), capture.status].forEach((value) => row.append(element("td", "", value)));
+    const handshake = element("td"); handshake.append(capture.capture_mode === "handshake" ? handshakePill(capture.handshake_state) : element("span", "muted", "—")); row.append(handshake); const td = element("td"); td.append(actions); row.append(td); tbody.append(row);
     const mobileRemove = element("button", "btn danger", "Delete"); mobileRemove.addEventListener("click", deleteAction);
-    const mobileActions = [actionLink("PCAP", pcap.href), actionLink("JSON", summary.href), mobileRemove]; cards.append(mobileHistoryCard(capture.name, fmtBytes(capture.size_bytes), [["Duration", fmtDuration(duration)], ["Packets", capture.packet_count ?? "—"], ["Status", capture.status]], mobileActions));
+    const mobileActions = [actionLink("PCAP", pcap.href), actionLink("JSON", summary.href), mobileRemove], mobileBadge = capture.capture_mode === "handshake" ? handshakeLabel(capture.handshake_state) : fmtBytes(capture.size_bytes), mobileTone = capture.capture_mode === "handshake" ? handshakeTone(capture.handshake_state) : "blue"; cards.append(mobileHistoryCard(capture.name, mobileBadge, [["Duration", fmtDuration(duration)], ["Packets", capture.packet_count ?? "—"], ["Status", capture.status]], mobileActions, mobileTone));
   });
 }
-function renderCaptureTarget(target) {
+function renderCaptureTarget(target, captureInterface = null) {
   const panel = $("#captureTargetDetails"); clear(panel);
   if (!target?.selected && !target?.bssid) return empty(panel, "No current target. Choose a network in Recon.");
-  [["Target SSID", target.ssid || "<hidden>"], ["BSSID", target.bssid], ["Channel", target.channel], ["Band", bandLabel(target.band)], ["Frequency", target.frequency ? `${target.frequency} MHz` : "—"], ["Security", target.security || "Unknown"]].forEach(([label, value]) => { const item = element("span", "", label); item.append(element("strong", "", value)); panel.append(item); });
+  [["Target SSID", target.ssid || "<hidden>"], ["BSSID", target.bssid], ["Channel", target.channel], ["Security", target.security || "Unknown"], ["Adapter", captureInterface || "Select below"]].forEach(([label, value]) => { const item = element("span", "", label); item.append(element("strong", "", value)); panel.append(item); });
 }
 function updateCaptureModeUI() {
-  const targeted = $("#captureMode").value === "targeted";
+  const targeted = $("#captureMode").value !== "raw";
   $("#captureTargetPanel").classList.toggle("hidden", !targeted);
   $("#rawCaptureChannelField").classList.toggle("hidden", targeted);
   const missingTarget = targeted && !state.currentTarget;
@@ -432,18 +437,46 @@ function updateCaptureModeUI() {
 }
 async function loadCapture() {
   const data = await api("/captures"), status = data.status;
+  state.captureStatus = status;
   if (status.active && status.target) renderCurrentTarget({selected: true, ...status.target});
-  if (!status.active && state.capturePrefill && state.currentTarget) $("#captureMode").value = "targeted";
-  if (!status.active && !state.currentTarget && $("#captureMode").value === "targeted") $("#captureMode").value = "raw";
+  if (status.active) $("#captureMode").value = status.capture_mode === "raw" ? "raw" : "handshake";
+  else if (state.capturePrefill && state.currentTarget) $("#captureMode").value = "handshake";
   const selectedTarget = status.target || state.currentTarget;
-  renderCaptureTarget(selectedTarget);
-  await loadInterfaces({captureInterface: status.interface, captureRole: "capture", captureTargetChannel: $("#captureMode").value === "targeted" ? selectedTarget?.channel : null});
+  const targetMode = $("#captureMode").value !== "raw";
+  await loadInterfaces({captureInterface: status.interface, captureRole: "capture", captureTargetChannel: targetMode ? selectedTarget?.channel : null});
+  renderCaptureTarget(selectedTarget, status.interface || $("#captureInterface").value);
   $("#captureBtn").textContent = status.active ? "Stop Capture" : "Start Capture"; $("#captureBtn").className = `btn full ${status.active ? "danger" : "primary"}`;
   ["#captureMode", "#captureInterface", "#captureChannel", "#captureName"].forEach((id) => { $(id).disabled = status.active; });
   $("#captureInterface").disabled = status.active || !$("#captureInterface").value;
   updateCaptureModeUI();
-  const targetText = status.capture_mode === "targeted" && status.target ? ` · target ${status.target.ssid} (${status.target.bssid})` : " · raw channel capture";
-  setNotice($("#captureNotice"), status.active ? `Capturing on ${status.interface} · CH ${status.channel}${targetText} · ${fmtBytes(status.size_bytes)} · elapsed ${fmtDuration(status.elapsed_seconds)}` : ($("#captureMode").value === "targeted" ? "Choose a free adapter, then start a target-associated capture. Capture continues until manually stopped." : "Raw mode captures all visible 802.11 traffic on the selected channel until manually stopped."), status.process_alive === false ? "warning" : "");
+  const targetText = status.capture_mode !== "raw" && status.target ? ` · target ${status.target.ssid || "<hidden>"} (${status.target.bssid})` : " · raw channel capture";
+  setNotice($("#captureNotice"), status.active ? `Capturing on ${status.interface} · CH ${status.channel}${targetText} · ${fmtBytes(status.size_bytes)} · elapsed ${fmtDuration(status.elapsed_seconds)}` : (targetMode ? "Choose a current Recon target and a free adapter. Handshake capture listens passively until you stop it." : "Raw mode captures all visible 802.11 traffic on the selected channel until manually stopped."), status.process_alive === false ? "warning" : "");
+
+  const handshakeActive = status.active && status.capture_mode === "handshake";
+  const panel = $("#handshakePanel"), badge = $("#handshakeBadge"), clientSelect = $("#captureClient");
+  panel.classList.toggle("hidden", !handshakeActive);
+  panel.classList.remove("state-not_captured", "state-partial", "state-full");
+  if (handshakeActive) {
+    const handshakeState = status.handshake_state || "not_captured", previousClient = clientSelect.value;
+    panel.classList.add(`state-${handshakeState}`);
+    badge.textContent = handshakeLabel(handshakeState); badge.className = `pill ${handshakeTone(handshakeState)}`.trim();
+    clear(clientSelect);
+    const clients = status.observed_clients || [];
+    if (!clients.length) clientSelect.append(option("", "No client observed"));
+    clients.forEach((client) => clientSelect.append(option(client.mac, `${client.mac}${client.source === "captured_eapol" ? " · captured EAPOL" : " · Recon"}`)));
+    if ([...clientSelect.options].some((item) => item.value === previousClient)) clientSelect.value = previousClient;
+    else if (status.handshake_client_mac && [...clientSelect.options].some((item) => item.value === status.handshake_client_mac)) clientSelect.value = status.handshake_client_mac;
+    clientSelect.disabled = !clients.length;
+    $("#captureClientHint").textContent = clients.length ? `${clients.length} client${clients.length === 1 ? "" : "s"} observed for this target.` : "Capture continues passively when no client is selected.";
+    $("#captureReconnectBtn").disabled = status.process_alive === false || !status.target || !clientSelect.value;
+    $("#activeCaptureDownload").href = `/api/captures/${encodeURIComponent(status.capture_id)}/download`;
+    setNotice($("#captureReconnectNotice"), state.reconnectMessage || "");
+    $("#captureReconnectNotice").classList.toggle("hidden", !state.reconnectMessage);
+  } else {
+    clientSelect.disabled = true;
+    $("#captureReconnectBtn").disabled = true;
+    $("#activeCaptureDownload").removeAttribute("href");
+  }
   state.capturePrefill = false; renderCaptureHistory(data.history);
 }
 
@@ -489,7 +522,19 @@ $("#captureMode").addEventListener("change", () => { state.capturePrefill = fals
 $("#changeCaptureTarget").addEventListener("click", () => gotoPage("recon"));
 $("#reconBtn").addEventListener("click", () => perform($("#reconBtn"), async () => { const active = $("#reconBtn").textContent.startsWith("Stop"); await api("/recon", active ? {method: "DELETE"} : {method: "POST", body: JSON.stringify({interface: $("#reconInterface").value, mode: $("#reconMode").value})}); }));
 $("#apBtn").addEventListener("click", () => perform($("#apBtn"), async () => { const active = $("#apBtn").textContent.startsWith("Stop"); state.apError = null; if (active) return api("/access-point", {method: "DELETE"}); await api("/access-point", {method: "POST", body: JSON.stringify({interface: $("#apInterface").value, ssid: $("#apSsid").value, band: $("#apBand").value, channel: $("#apChannelMode").value === "auto" ? "auto" : Number($("#apChannel").value), security: $("#apSecurity").value, password: $("#apPassword").value, uplink: $("#apUplink").value, forwarding: $("#apForwarding").checked && $("#apUplink").value !== "none", log_clients: $("#apLogClients").checked, capture_traffic: $("#apCaptureTraffic").checked})}); }, (error) => { state.apError = error.message || "Access Point failed to start."; }));
-$("#captureBtn").addEventListener("click", () => perform($("#captureBtn"), async () => { const active = $("#captureBtn").textContent.startsWith("Stop"); const mode = $("#captureMode").value; await api("/captures", active ? {method: "DELETE"} : {method: "POST", body: JSON.stringify({interface: $("#captureInterface").value, channel: mode === "raw" ? Number($("#captureChannel").value) : state.currentTarget?.channel, name: $("#captureName").value, mode, target: mode === "targeted" ? {bssid: state.currentTarget?.bssid} : null})}); }));
+$("#captureBtn").addEventListener("click", () => perform($("#captureBtn"), async () => { const active = $("#captureBtn").textContent.startsWith("Stop"); const mode = $("#captureMode").value; state.reconnectMessage = null; await api("/captures", active ? {method: "DELETE"} : {method: "POST", body: JSON.stringify({interface: $("#captureInterface").value, channel: mode === "raw" ? Number($("#captureChannel").value) : state.currentTarget?.channel, name: $("#captureName").value, mode, target: mode !== "raw" ? {bssid: state.currentTarget?.bssid} : null})}); }));
+$("#captureClient").addEventListener("change", () => { const status = state.captureStatus; $("#captureReconnectBtn").disabled = !status?.active || status.capture_mode !== "handshake" || status.process_alive === false || !$("#captureClient").value; });
+$("#captureReconnectBtn").addEventListener("click", () => {
+  const status = state.captureStatus, clientMac = $("#captureClient").value;
+  if (!status?.active || status.capture_mode !== "handshake" || !status.target || !clientMac) return;
+  const warning = `Temporarily disconnect ${clientMac} from ${status.target.ssid || status.target.bssid}? Only continue if you are authorized to test this network and device.`;
+  if (!window.confirm(warning)) return;
+  perform($("#captureReconnectBtn"), async () => {
+    const limits = status.reconnect_limits || {};
+    const result = await api(`/captures/${encodeURIComponent(status.capture_id)}/reconnect`, {method: "POST", body: JSON.stringify({client_mac: clientMac, bssid: status.target.bssid, channel: status.channel, count: Math.min(3, limits.max_count || 3), duration_seconds: Math.min(10, limits.max_duration_seconds || 10)})});
+    state.reconnectMessage = result.capture_active ? `Bounded reconnect request completed for ${clientMac}. Capture is still running.` : "Reconnect request completed, but the capture process is no longer active.";
+  });
+});
 $("#reconSearch").addEventListener("input", () => { if (state.recon) renderReconResults(state.recon); });
 $$('#recon th[data-sort]').forEach((header) => header.addEventListener("click", () => { const key = header.dataset.sort; state.reconSort.direction = state.reconSort.key === key ? state.reconSort.direction * -1 : 1; state.reconSort.key = key; if (state.recon) renderReconResults(state.recon); }));
 $("#reconSession").addEventListener("change", async () => { try { if (!$("#reconSession").value) return loadRecon(); renderReconResults(await api(`/recon/${encodeURIComponent($("#reconSession").value)}`)); } catch (error) { showError(error); } });

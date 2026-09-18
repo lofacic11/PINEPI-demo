@@ -56,6 +56,10 @@ def test_version_one_database_migrates_without_losing_sessions(tmp_path):
     assert "resolved_channel" in ap
     assert capture["name"] == "Existing capture"
     assert capture["capture_mode"] == "raw"
+    assert capture["handshake_state"] is None
+    assert capture["handshake_client_mac"] is None
+    assert capture["reconnect_count"] == 0
+    assert capture["last_reconnect_at"] is None
     client = database.fetchone("SELECT * FROM ap_clients WHERE session_id='ap-old'")
     assert client["ip_address"] == "10.77.0.12"
     assert client["upload_bytes"] == 205599

@@ -18,14 +18,21 @@ from .adapters import AdapterService, Reservation, ReservationRegistry
 from .db import Database
 from .errors import PinePiError, require
 from .events import EventLog
-from .privileged import OwnedProcess, PrivilegedService, normalize_client_mac
+from .privileged import (
+    DEAUTH_MAX_COUNT,
+    DEAUTH_MAX_DURATION_SECONDS,
+    OwnedProcess,
+    PrivilegedService,
+    normalize_bssid,
+    normalize_client_mac,
+)
 
-BSSID_PATTERN = re.compile(r"^(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$")
 AP_AUTO_24_CHANNELS = (1, 6, 11)
 AP_AUTO_5_CHANNELS = (36, 40, 44, 48, 149, 153, 157, 161, 165)
 RECON_RECOMMENDATION_MAX_AGE = 15 * 60
 TARGET_RECENT_MAX_AGE = 30 * 60
 NOTE_LABELS = {"test target", "trusted", "investigate", "lab ap"}
+HANDSHAKE_STATES = {"not_captured": 0, "partial": 1, "full": 2}
 
 
 def utcnow() -> str:
@@ -65,6 +72,83 @@ def channel_frequency(channel: int) -> int | None:
     return None
 
 
+def analyze_eapol_key_frames(frames: list[dict], target_bssid: str) -> dict:
+    """Reduce EAPOL-Key observations to a per-client, target-scoped handshake state."""
+
+    target_bssid = normalize_bssid(target_bssid)
+    messages_by_client: dict[str, set[tuple[str, int | None]]] = {}
+    for frame in frames:
+        if not isinstance(frame, dict) or str(frame.get("bssid") or "").upper() != target_bssid:
+            continue
+        source = str(frame.get("source") or "").upper()
+        destination = str(frame.get("destination") or "").upper()
+        client_value = destination if source == target_bssid else source if destination == target_bssid else None
+        if not client_value:
+            continue
+        try:
+            client = normalize_client_mac(client_value)
+        except PinePiError:
+            continue
+        if client == target_bssid:
+            continue
+        try:
+            message_number = int(str(frame.get("message_number") or "").split(",", 1)[0], 0)
+        except (TypeError, ValueError):
+            message_number = 0
+        if 1 <= message_number <= 4:
+            message = f"m{message_number}"
+        else:
+            try:
+                value = str(frame.get("key_info") or "").split(",", 1)[0].strip()
+                key_info = int(value, 0)
+            except (TypeError, ValueError):
+                continue
+            if not key_info & 0x0008:
+                continue
+            acknowledge = bool(key_info & 0x0080)
+            mic = bool(key_info & 0x0100)
+            secure = bool(key_info & 0x0200)
+            if acknowledge and not mic:
+                message = "m1"
+            elif not acknowledge and mic and not secure:
+                message = "m2"
+            elif acknowledge and mic:
+                message = "m3"
+            elif not acknowledge and mic and secure:
+                message = "m4"
+            else:
+                continue
+        try:
+            replay_counter = int(str(frame.get("replay_counter") or "").split(",", 1)[0], 0)
+            if not 0 <= replay_counter < 2**64:
+                replay_counter = None
+        except (TypeError, ValueError):
+            replay_counter = None
+        messages_by_client.setdefault(client, set()).add((message, replay_counter))
+
+    client_states = []
+    for client, observations in messages_by_client.items():
+        replay_by_message = {
+            message: {replay for observed, replay in observations if observed == message and replay is not None}
+            for message in ("m1", "m2", "m3", "m4")
+        }
+        m1_m2 = bool(replay_by_message["m1"] & replay_by_message["m2"])
+        m2_m3 = any(
+            replay in replay_by_message["m3"] or replay + 1 in replay_by_message["m3"]
+            for replay in replay_by_message["m2"]
+        )
+        full = m1_m2 or m2_m3
+        client_states.append({"mac": client, "state": "full" if full else "partial"})
+    client_states.sort(key=lambda item: (-HANDSHAKE_STATES[item["state"]], item["mac"]))
+    state = client_states[0]["state"] if client_states else "not_captured"
+    return {
+        "state": state,
+        "client_mac": client_states[0]["mac"] if client_states else None,
+        "clients": client_states,
+        "unique_message_count": sum(len(messages) for messages in messages_by_client.values()),
+    }
+
+
 @dataclass
 class ActiveRecon:
     id: str
@@ -90,6 +174,12 @@ class ActiveCapture:
     capture_mode: str = "raw"
     target: dict | None = None
     state: str = "RUNNING"
+    handshake_state: str | None = None
+    handshake_client_mac: str | None = None
+    handshake_checked_at: float = 0.0
+    handshake_client_macs: set[str] = field(default_factory=set)
+    known_client_macs: set[str] = field(default_factory=set)
+    handshake_error_code: str | None = None
 
 
 @dataclass
@@ -227,9 +317,7 @@ class OperationService:
 
     @staticmethod
     def _validate_bssid(value: str) -> str:
-        bssid = str(value or "").upper()
-        require(bool(BSSID_PATTERN.fullmatch(bssid)), "INVALID_BSSID", "BSSID must be a valid MAC address.")
-        return bssid
+        return normalize_bssid(value)
 
     @staticmethod
     def _network_payload(network: dict) -> dict:
@@ -942,9 +1030,107 @@ class OperationService:
                 (active.id, client["mac"], client["bssid"], client["signal"], client["first_seen"], client["last_seen"]),
             )
 
-    # Standalone Capture. Targeted mode still receives every frame visible to
-    # the monitor adapter on the selected channel; target metadata provides
-    # association and filtering context rather than a hardware BSSID filter.
+    @staticmethod
+    def _handshake_security_supported(value: str | None) -> bool:
+        tokens = set(re.split(r"[^A-Z0-9]+", str(value or "").upper()))
+        return bool(tokens & {"WPA", "WPA2"})
+
+    def _capture_observed_clients(self, active: ActiveCapture) -> list[dict]:
+        if active.capture_mode != "handshake" or not active.target:
+            return []
+        bssid = active.target["bssid"]
+        clients: dict[str, dict] = {}
+        for item in self.observed_clients(bssid):
+            age = self._age_seconds(item.get("last_seen"))
+            if age is None or age > TARGET_RECENT_MAX_AGE:
+                continue
+            try:
+                mac = normalize_client_mac(item.get("mac", ""))
+            except PinePiError:
+                continue
+            clients[mac] = {
+                "mac": mac,
+                "signal": item.get("signal"),
+                "last_seen": item.get("last_seen"),
+                "source": "recon",
+            }
+        for mac in active.handshake_client_macs:
+            clients.setdefault(mac, {
+                "mac": mac,
+                "signal": None,
+                "last_seen": None,
+                "source": "captured_eapol",
+            })
+        newly_observed = set(clients) - active.known_client_macs
+        for mac in sorted(newly_observed):
+            self.events.write(
+                "INFO", "capture", "client_detected",
+                "Client associated with the handshake target was observed.",
+                capture_id=active.id,
+                target_bssid=bssid,
+                client_mac=mac,
+                source=clients[mac]["source"],
+            )
+        active.known_client_macs.update(clients)
+        return sorted(clients.values(), key=lambda item: item["mac"])
+
+    def _refresh_handshake(self, active: ActiveCapture, *, force: bool = False) -> None:
+        if active.capture_mode != "handshake" or not active.target:
+            return
+        checked_at = time.monotonic()
+        if not force and checked_at - active.handshake_checked_at < 2:
+            return
+        active.handshake_checked_at = checked_at
+        try:
+            frames = self.privileged.capture_handshake_frames(
+                active.path,
+                active.id,
+                active.target["bssid"],
+            )
+            analysis = analyze_eapol_key_frames(frames, active.target["bssid"])
+            active.handshake_error_code = None
+        except Exception as exc:  # noqa: BLE001 - analysis failure must never interrupt capture cleanup
+            error_code = getattr(exc, "code", type(exc).__name__)
+            if active.handshake_error_code != error_code:
+                self.events.write(
+                    "WARNING", "capture", "handshake_analysis_failed",
+                    "Handshake analysis is temporarily unavailable; capture continues.",
+                    capture_id=active.id,
+                    error_code=error_code,
+                )
+            active.handshake_error_code = error_code
+            return
+
+        active.handshake_client_macs.update(item["mac"] for item in analysis["clients"])
+        old_state = active.handshake_state or "not_captured"
+        new_state = analysis["state"]
+        if HANDSHAKE_STATES[new_state] < HANDSHAKE_STATES[old_state]:
+            new_state = old_state
+            new_client = active.handshake_client_mac
+        else:
+            new_client = analysis["client_mac"] or active.handshake_client_mac
+        if new_state == old_state and new_client == active.handshake_client_mac:
+            return
+        active.handshake_state = new_state
+        active.handshake_client_mac = new_client
+        updated_at = utcnow()
+        self.db.execute(
+            "UPDATE captures SET handshake_state=?,handshake_client_mac=?,handshake_updated_at=? WHERE id=?",
+            (new_state, new_client, updated_at, active.id),
+        )
+        if HANDSHAKE_STATES[new_state] > HANDSHAKE_STATES[old_state]:
+            event = "partial_handshake_detected" if new_state == "partial" else "full_handshake_detected"
+            message = "Partial WPA/WPA2 handshake detected." if new_state == "partial" else "Full WPA/WPA2 handshake captured."
+            self.events.write(
+                "INFO", "capture", event, message,
+                capture_id=active.id,
+                target_bssid=active.target["bssid"],
+                client_mac=new_client,
+            )
+
+    # Standalone Capture. Targeted and handshake modes still receive every
+    # frame visible to the monitor adapter on the selected channel; target
+    # metadata provides analysis context rather than a hardware BSSID filter.
     def start_capture(
         self,
         interface: str,
@@ -954,12 +1140,23 @@ class OperationService:
         target: dict | None = None,
     ) -> dict:
         capture_mode = str(capture_mode or "raw").lower()
-        require(capture_mode in {"raw", "targeted"}, "INVALID_CAPTURE_MODE", "Capture mode must be raw or targeted.")
+        require(
+            capture_mode in {"raw", "targeted", "handshake"},
+            "INVALID_CAPTURE_MODE",
+            "Capture mode must be raw, targeted, or handshake.",
+        )
         target_data = None
-        if capture_mode == "targeted":
+        if capture_mode in {"targeted", "handshake"}:
             supplied_bssid = target.get("bssid") if isinstance(target, dict) else None
             target_data = self._target_for_capture(supplied_bssid)
             channel = int(target_data["channel"])
+            if capture_mode == "handshake" and not self._handshake_security_supported(target_data.get("security")):
+                raise PinePiError(
+                    "HANDSHAKE_SECURITY_UNSUPPORTED",
+                    "Handshake capture requires a WPA or WPA2 target observed in Recon.",
+                    409,
+                    {"bssid": target_data["bssid"], "security": target_data.get("security")},
+                )
         else:
             try:
                 channel = int(channel)
@@ -968,7 +1165,7 @@ class OperationService:
         require(1 <= channel <= 196, "INVALID_CHANNEL", "Channel is out of range.")
         adapter = self.adapters.require_wireless(interface, "monitor")
         supported = adapter.get("capabilities", {}).get("ap_channels") or []
-        if capture_mode == "targeted" and supported and channel not in supported:
+        if capture_mode in {"targeted", "handshake"} and supported and channel not in supported:
             raise PinePiError(
                 "ADAPTER_CHANNEL_UNSUPPORTED",
                 f"{interface} does not advertise channel {channel} for the selected target.",
@@ -988,8 +1185,8 @@ class OperationService:
             try:
                 self.db.execute(
                     "INSERT INTO captures(id,name,interface,channel,started_at,status,path,capture_mode,"
-                    "target_bssid,target_ssid,target_frequency,target_band,target_security,target_last_seen) "
-                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "target_bssid,target_ssid,target_frequency,target_band,target_security,target_last_seen,"
+                    "handshake_state,handshake_updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         operation_id, capture_name, interface, channel, started, "STARTING", str(path),
                         capture_mode, target_data.get("bssid") if target_data else None,
@@ -998,11 +1195,20 @@ class OperationService:
                         target_data.get("band") if target_data else None,
                         target_data.get("security") if target_data else None,
                         target_data.get("last_seen") if target_data else None,
+                        "not_captured" if capture_mode == "handshake" else None,
+                        started if capture_mode == "handshake" else None,
                     ),
                 )
                 self.privileged.record_restore(interface, operation_id)
                 self.privileged.set_monitor(interface, channel)
-                process = self.privileged.start_capture(interface, path, self.max_capture_bytes, operation_id)
+                process = self.privileged.start_capture(
+                    interface,
+                    path,
+                    self.max_capture_bytes,
+                    operation_id,
+                    channel,
+                    target_data.get("bssid") if target_data else None,
+                )
                 time.sleep(0.2)
                 if not process.alive():
                     raise PinePiError(
@@ -1012,6 +1218,7 @@ class OperationService:
                 self._capture = ActiveCapture(
                     operation_id, capture_name, interface, channel, started, path, reservation, process,
                     capture_mode=capture_mode, target=target_data,
+                    handshake_state="not_captured" if capture_mode == "handshake" else None,
                 )
                 self.db.execute("UPDATE captures SET status='RUNNING' WHERE id=?", (operation_id,))
                 self.events.write(
@@ -1020,6 +1227,15 @@ class OperationService:
                     target_bssid=target_data.get("bssid") if target_data else None,
                     channel=channel,
                 )
+                if capture_mode == "handshake":
+                    self.events.write(
+                        "INFO", "capture", "handshake_capture_started",
+                        "WPA/WPA2 handshake capture started.",
+                        capture_id=operation_id,
+                        interface=interface,
+                        target_bssid=target_data["bssid"],
+                        channel=channel,
+                    )
                 self._watch("capture", operation_id)
                 return self.capture_status()
             except Exception as exc:
@@ -1045,10 +1261,16 @@ class OperationService:
             active.state = "STOPPING"
             self.db.execute("UPDATE captures SET status='STOPPING' WHERE id=?", (active.id,))
             cleanup_ok = True
+            restore_ok = False
             try:
                 cleanup_ok &= self._cleanup_call("capture", active.id, "stop_process", lambda: self.privileged.stop_process(active.process))
             finally:
-                cleanup_ok &= self._cleanup_call("capture", active.id, "restore_interface", lambda: self.privileged.restore_interface(active.interface))
+                self._refresh_handshake(active, force=True)
+                restore_ok = self._cleanup_call(
+                    "capture", active.id, "restore_interface",
+                    lambda: self.privileged.restore_interface(active.interface),
+                )
+                cleanup_ok &= restore_ok
                 cleanup_ok &= self._cleanup_call("capture", active.id, "forget_restore", lambda: self.privileged.forget_restore(active.id))
                 self.registry.release(active.reservation)
                 size = active.path.stat().st_size if active.path.exists() else 0
@@ -1062,7 +1284,15 @@ class OperationService:
                 self.events.write(
                     "WARNING" if reason != "user" else "INFO", "capture", "stopped", "Standalone capture stopped.",
                     interface=active.interface, capture_id=active.id, reason=reason, size_bytes=size,
+                    handshake_state=active.handshake_state,
+                    handshake_client_mac=active.handshake_client_mac,
                 )
+                if restore_ok:
+                    self.events.write(
+                        "INFO", "capture", "adapter_restored",
+                        "Capture adapter was restored after capture stopped.",
+                        interface=active.interface, capture_id=active.id,
+                    )
                 if reason in {"size_limit", "low_space"}:
                     self.events.write(
                         "WARNING", "storage", "capture_limit", "Capture stopped by a storage protection limit.",
@@ -1074,17 +1304,131 @@ class OperationService:
             return {"state": "IDLE", "active": False, "reason": reason}
 
     def capture_status(self) -> dict:
-        active = self._capture
-        if not active:
-            return {"state": "IDLE", "active": False, "elapsed_seconds": 0}
-        size = active.path.stat().st_size if active.path.exists() else 0
-        return {
-            "state": active.state, "active": True, "capture_id": active.id, "name": active.name,
-            "interface": active.interface, "channel": active.channel, "started_at": active.started_at,
-            "elapsed_seconds": elapsed_seconds(active.started_at), "size_bytes": size,
-            "packet_count": None, "process_alive": active.process.alive(),
-            "capture_mode": active.capture_mode, "target": active.target,
-        }
+        with self._capture_lock:
+            active = self._capture
+            if not active:
+                return {
+                    "state": "IDLE", "active": False, "elapsed_seconds": 0,
+                    "handshake_state": None, "observed_clients": [],
+                }
+            self._refresh_handshake(active)
+            size = active.path.stat().st_size if active.path.exists() else 0
+            return {
+                "state": active.state, "active": True, "capture_id": active.id, "name": active.name,
+                "interface": active.interface, "channel": active.channel, "started_at": active.started_at,
+                "elapsed_seconds": elapsed_seconds(active.started_at), "size_bytes": size,
+                "packet_count": None, "process_alive": active.process.alive(),
+                "capture_mode": active.capture_mode, "target": active.target,
+                "handshake_state": active.handshake_state,
+                "handshake_client_mac": active.handshake_client_mac,
+                "observed_clients": self._capture_observed_clients(active),
+                "reconnect_limits": {
+                    "max_count": DEAUTH_MAX_COUNT,
+                    "max_duration_seconds": DEAUTH_MAX_DURATION_SECONDS,
+                } if active.capture_mode == "handshake" else None,
+            }
+
+    def request_capture_reconnect(self, capture_id: str, data: dict) -> dict:
+        with self._capture_lock:
+            active = self._capture
+            if not active or active.id != capture_id or active.state != "RUNNING":
+                raise PinePiError(
+                    "HANDSHAKE_CAPTURE_NOT_ACTIVE",
+                    "Reconnect requests require the matching active handshake capture.",
+                    409,
+                )
+            if active.capture_mode != "handshake" or not active.target:
+                raise PinePiError(
+                    "HANDSHAKE_CAPTURE_REQUIRED",
+                    "Reconnect requests are available only inside a WPA/WPA2 handshake capture.",
+                    409,
+                )
+            if not active.process.alive():
+                raise PinePiError("CAPTURE_PROCESS_EXITED", "The capture process is no longer running.", 409)
+
+            requested_bssid = normalize_bssid(data.get("bssid", active.target["bssid"]))
+            if requested_bssid != active.target["bssid"]:
+                raise PinePiError("CAPTURE_TARGET_MISMATCH", "BSSID does not match the active capture target.", 409)
+            channel_value = data.get("channel", active.channel)
+            if isinstance(channel_value, bool) or not isinstance(channel_value, int):
+                raise PinePiError("INVALID_CHANNEL", "Channel is out of range.")
+            requested_channel = channel_value
+            require(1 <= requested_channel <= 196, "INVALID_CHANNEL", "Channel is out of range.")
+            if requested_channel != active.channel:
+                raise PinePiError("CAPTURE_TARGET_MISMATCH", "Channel does not match the active capture.", 409)
+
+            client_mac = normalize_client_mac(data.get("client_mac", ""))
+            allowed_clients = {item["mac"] for item in self._capture_observed_clients(active)}
+            if client_mac not in allowed_clients:
+                raise PinePiError(
+                    "CLIENT_NOT_OBSERVED",
+                    "The client was not recently observed with the active capture target.",
+                    404,
+                    {"client_mac": client_mac, "target_bssid": requested_bssid},
+                )
+            count = self._bounded_reconnect_value(data.get("count", DEAUTH_MAX_COUNT), "count")
+            duration_seconds = self._bounded_reconnect_value(
+                data.get("duration_seconds", 10), "duration_seconds",
+            )
+            if count > DEAUTH_MAX_COUNT or duration_seconds > DEAUTH_MAX_DURATION_SECONDS:
+                raise PinePiError("DEAUTH_LIMIT_EXCEEDED", "Reconnect request exceeds the server safety limit.")
+
+            self.events.write(
+                "WARNING", "capture", "reconnect_requested",
+                "Bounded client reconnect requested during handshake capture.",
+                capture_id=active.id,
+                target_bssid=requested_bssid,
+                client_mac=client_mac,
+                count=count,
+                duration_seconds=duration_seconds,
+            )
+            try:
+                result = self.privileged.capture_reconnect(
+                    active.interface,
+                    active.id,
+                    requested_bssid,
+                    requested_channel,
+                    client_mac,
+                    count,
+                    duration_seconds,
+                )
+            except PinePiError as exc:
+                self.events.write(
+                    "ERROR", "capture", "reconnect_failed",
+                    "Bounded client reconnect request failed; capture continues.",
+                    capture_id=active.id,
+                    target_bssid=requested_bssid,
+                    client_mac=client_mac,
+                    error_code=exc.code,
+                )
+                raise
+            completed_at = utcnow()
+            self.db.execute(
+                "UPDATE captures SET reconnect_count=reconnect_count+1,last_reconnect_at=?,"
+                "last_reconnect_client=? WHERE id=?",
+                (completed_at, client_mac, active.id),
+            )
+            self.events.write(
+                "INFO", "capture", "bounded_deauth_completed",
+                "Bounded client reconnect request completed; handshake capture remains active.",
+                capture_id=active.id,
+                target_bssid=requested_bssid,
+                client_mac=client_mac,
+                count=count,
+            )
+            return {
+                **result,
+                "capture_active": bool(active.process.alive()),
+                "handshake_state": active.handshake_state,
+            }
+
+    @staticmethod
+    def _bounded_reconnect_value(value, field_name: str) -> int:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise PinePiError("DEAUTH_LIMIT_EXCEEDED", f"Reconnect {field_name} must be an integer.")
+        if value < 1:
+            raise PinePiError("DEAUTH_LIMIT_EXCEEDED", f"Reconnect {field_name} must be positive.")
+        return value
 
     def capture_history(self) -> list[dict]:
         return self.db.fetchall("SELECT * FROM captures ORDER BY started_at DESC LIMIT 100")
@@ -1201,7 +1545,14 @@ class OperationService:
                         session_id=operation_id, ap_interface=interface, uplink=effective_uplink,
                     )
                 if capture_traffic and capture_path:
-                    capture = self.privileged.start_capture(interface, capture_path, self.max_capture_bytes, operation_id + "-traffic")
+                    capture = self.privileged.start_capture(
+                        interface,
+                        capture_path,
+                        self.max_capture_bytes,
+                        operation_id + "-traffic",
+                        channel,
+                        None,
+                    )
                     time.sleep(0.2)
                     if not capture.alive():
                         raise PinePiError(
@@ -1600,13 +1951,15 @@ class OperationService:
                     aps, clients = self._parse_airodump(active.prefix)
                     self._refresh_network_monitor(aps, clients)
                 elif kind == "capture":
-                    active = self._capture
-                    if not active or active.id != operation_id:
-                        return
-                    reason = self._capture_guard(active.path, active.process)
-                    if reason:
-                        self.stop_capture(reason)
-                        return
+                    with self._capture_lock:
+                        active = self._capture
+                        if not active or active.id != operation_id:
+                            return
+                        reason = self._capture_guard(active.path, active.process)
+                        if reason:
+                            self.stop_capture(reason)
+                            return
+                        self._refresh_handshake(active)
                 elif kind == "ap":
                     with self._ap_lock:
                         active = self._ap
